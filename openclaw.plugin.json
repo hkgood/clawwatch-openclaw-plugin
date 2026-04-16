@@ -1,20 +1,15 @@
 {
   "id": "clawwatch",
   "name": "ClawWatch",
-  "description": "ClawWatch node agent: register with Worker, bind via link token or binding code, and report telemetry. Ships clawwatch-agent CLI plus a Gateway background service for adaptive reporting.",
+  "description": "ClawWatch node agent: register with Worker (https://cw.osglab.win), bind via link token or binding code, and report telemetry. Ships clawwatch-agent CLI plus a Gateway background service for adaptive reporting.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "worker_base_url": {
-        "type": "string",
-        "description": "ClawWatch Worker origin without trailing slash (e.g. https://your-worker.workers.dev). Required for the background reporting service."
-      },
       "state_path": {
         "type": "string",
         "description": "Optional path to agent state JSON. Default: ~/.clawwatch/agent.json (or CLAWWATCH_STATE)."
       }
-    },
-    "required": ["worker_base_url"]
+    }
   }
 }

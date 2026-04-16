@@ -11,7 +11,7 @@
 
 ## OpenClaw 用户：安装与配置
 
-- **兼容**：本包 `package.json` 中 `openclaw.compat` / `openclaw.build` 以 **OpenClaw 2026.4.14** 为基线；请使用相同或更新且满足 `pluginApi` 的 Gateway（详见 [Building Plugins](https://docs.openclaw.ai/plugins/building-plugins)）。
+- **兼容**：本包 `package.json` 中 `openclaw.compat` / `openclaw.build` 以 **OpenClaw 2026.3.1** 为最低基线（低于此前的 `2026.4.14` 要求）；请使用满足 `pluginApi` 的 Gateway（详见 [Building Plugins](https://docs.openclaw.ai/plugins/building-plugins)）。
 - **Node**：开发与作为插件安装的环境需 **Node ≥ 22**（`engines.node`）。仅运行已编译 CLI 的极简场景仍可用 Node 18+ 直接执行 `node src/agent.mjs`，但 `npm install` 本包会按 engines 校验。
 
 安装示例（任选其一）：
@@ -24,7 +24,7 @@ openclaw plugins install clawhub:clawwatch-openclaw-plugin
 openclaw plugins install -l /path/to/clawwatch-openclaw-plugin
 ```
 
-在 OpenClaw 配置中为插件 `clawwatch`（与 `openclaw.plugin.json` 的 `id` 一致）提供 **必填** `worker_base_url`（示例为 JSON5，请按你实际配置文件格式书写）：
+在 OpenClaw 配置中为插件 `clawwatch`（与 `openclaw.plugin.json` 的 `id` 一致）启用即可；**Worker 根地址已固定为 `https://cw.osglab.win`**，无需再填 `worker_base_url`。可选 `state_path` 指定状态文件路径（JSON5 示例）：
 
 ```json5
 {
@@ -34,7 +34,6 @@ openclaw plugins install -l /path/to/clawwatch-openclaw-plugin
       clawwatch: {
         enabled: true,
         config: {
-          worker_base_url: "https://你的-worker.workers.dev",
           // state_path: "/optional/custom/agent.json",
         },
       },
@@ -43,7 +42,7 @@ openclaw plugins install -l /path/to/clawwatch-openclaw-plugin
 }
 ```
 
-修改配置后执行 **`openclaw gateway restart`**（或依赖你当前的 config watch 行为）。后台服务会在启动时 `spawn` 本包内的 `src/agent.mjs run --base <worker_base_url>`，并把 `state_path` 映射为环境变量 `CLAWWATCH_STATE`（若设置）。
+修改配置后执行 **`openclaw gateway restart`**（或依赖你当前的 config watch 行为）。后台服务会在启动时 `spawn` 本包内的 `src/agent.mjs run --base https://cw.osglab.win`，并把 `state_path` 映射为环境变量 `CLAWWATCH_STATE`（若设置）。
 
 **说明**：`setup` / `bind` 仍建议通过 **`clawwatch-agent` CLI**（全局安装或 `npx` / `node src/agent.mjs`）在节点上执行一次；Gateway Service 主要负责 **已登记且绑定后** 的常驻 `run` 循环。
 
@@ -54,7 +53,7 @@ openclaw plugins install -l /path/to/clawwatch-openclaw-plugin
 | 项目 | 要求 |
 |------|------|
 | **Node.js** | **≥ 22**（安装本 npm 包 / 作为 OpenClaw 插件开发时）；裸跑 `node src/agent.mjs` 可仍用 18+ |
-| **ClawWatch Worker** | 已部署并可访问的根地址（无尾部 `/`） |
+| **ClawWatch Worker** | 插件与默认 CLI 使用固定地址 `https://cw.osglab.win`；自建 Worker 时请在命令行对 `clawwatch-agent` 显式传入 `--base` |
 | **ClawWatch 账号与 App** | 生成 **link token** 或（旧流程）扫码绑定码完成绑定 |
 
 ---

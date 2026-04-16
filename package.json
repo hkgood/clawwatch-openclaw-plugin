@@ -1,6 +1,6 @@
 {
   "name": "clawwatch-openclaw-plugin",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "OpenClaw plugin + CLI: ClawWatch node agent (setup, bind, adaptive report to ClawWatch Worker)",
   "type": "module",
   "main": "./dist/index.js",
@@ -46,16 +46,16 @@
   "openclaw": {
     "extensions": ["./dist/index.js"],
     "compat": {
-      "pluginApi": ">=2026.4.14",
-      "minGatewayVersion": "2026.4.14"
+      "pluginApi": ">=2026.3.1",
+      "minGatewayVersion": "2026.3.1"
     },
     "build": {
-      "openclawVersion": "2026.4.14",
-      "pluginSdkVersion": "2026.4.14"
+      "openclawVersion": "2026.3.1",
+      "pluginSdkVersion": "2026.3.1"
     }
   },
   "peerDependencies": {
-    "openclaw": ">=2026.4.14"
+    "openclaw": ">=2026.3.1"
   },
   "peerDependenciesMeta": {
     "openclaw": {

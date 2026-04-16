@@ -6,12 +6,14 @@ import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** 固定 ClawWatch Worker 根地址（与 iOS / 官方节点默认一致）。 */
+const CLAWWATCH_WORKER_BASE_URL = 'https://cw.osglab.win';
+
 const pluginManifest = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', 'openclaw.plugin.json'), 'utf8'),
 ) as { configSchema: Record<string, unknown> };
 
 type ClawWatchPluginConfig = {
-  worker_base_url?: string;
   state_path?: string;
 };
 
@@ -34,19 +36,11 @@ export default definePluginEntry({
   configSchema: pluginManifest.configSchema,
   register(api) {
     const cfg = (api.pluginConfig ?? {}) as ClawWatchPluginConfig;
-    const baseRaw = typeof cfg.worker_base_url === 'string' ? cfg.worker_base_url : '';
-    const base = baseRaw ? normalizeBase(baseRaw) : '';
+    const base = normalizeBase(CLAWWATCH_WORKER_BASE_URL);
 
     api.registerService({
       id: `${api.id}.telemetry-agent`,
       async start(ctx) {
-        if (!base) {
-          ctx.logger.warn(
-            '[clawwatch] Missing worker_base_url in plugin config; reporting service not started. Set plugins.entries.clawwatch.config.worker_base_url.',
-          );
-          return;
-        }
-
         if (runChild && !runChild.killed) {
           ctx.logger.warn('[clawwatch] Reporting service already running; skipping duplicate start.');
           return;

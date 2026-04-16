@@ -41,8 +41,8 @@ npm run build
 npx clawhub@latest package publish . --family code-plugin \
   --name clawwatch-openclaw-plugin \
   --display-name "ClawWatch" \
-  --version 1.1.0 \
-  --changelog "Describe this release" \
+  --version 1.2.0 \
+  --changelog "Lower OpenClaw baseline to 2026.3.1; hardcode Worker https://cw.osglab.win; drop worker_base_url config." \
   --source-repo hkgood/clawwatch-openclaw-plugin \
   --source-commit "$(git rev-parse HEAD)"
 ```
