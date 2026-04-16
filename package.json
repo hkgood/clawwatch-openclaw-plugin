@@ -1,26 +1,70 @@
 {
   "name": "clawwatch-openclaw-plugin",
-  "version": "1.0.0",
-  "description": "OpenClaw-side ClawWatch agent: setup, link-token claim, adaptive report to ClawWatch Worker",
+  "version": "1.1.0",
+  "description": "OpenClaw plugin + CLI: ClawWatch node agent (setup, bind, adaptive report to ClawWatch Worker)",
   "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "bin": {
     "clawwatch-agent": "./src/agent.mjs"
   },
   "files": [
+    "dist",
     "src",
-    "README.md"
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/hkgood/clawwatch-openclaw-plugin.git"
   },
+  "bugs": {
+    "url": "https://github.com/hkgood/clawwatch-openclaw-plugin/issues"
+  },
+  "homepage": "https://github.com/hkgood/clawwatch-openclaw-plugin#readme",
+  "author": "hkgood",
   "license": "MIT",
   "keywords": [
     "clawwatch",
     "openclaw",
-    "telemetry"
-  ]
+    "openclaw-plugin",
+    "telemetry",
+    "clawhub"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.4.14",
+      "minGatewayVersion": "2026.4.14"
+    },
+    "build": {
+      "openclawVersion": "2026.4.14",
+      "pluginSdkVersion": "2026.4.14"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.4.14"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3"
+  }
 }
