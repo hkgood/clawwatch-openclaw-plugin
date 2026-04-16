@@ -28,16 +28,25 @@ openclaw gateway restart
 
 Enable the plugin in your OpenClaw config under `plugins.entries.clawwatch` (see README). Use `openclaw plugins list` / `openclaw plugins inspect clawwatch` to verify load.
 
-## ClawHub dry-run
+## ClawHub 发布
 
-Install the [ClawHub CLI](https://docs.openclaw.ai/tools/clawhub), log in (`clawhub login`), then:
+1. 安装 CLI：`npm i -g clawhub` 或本仓库用 `npx clawhub@latest`。  
+2. **登录**（二选一）：  
+   - 浏览器：`clawhub login`  
+   - 无浏览器 / CI：`clawhub login --no-browser --token <在 https://clawhub.ai 生成的 API Token>`  
+3. 在本仓库根目录：
 
 ```bash
 npm run build
-clawhub package publish . --dry-run
+npx clawhub@latest package publish . --family code-plugin \
+  --name clawwatch-openclaw-plugin \
+  --display-name "ClawWatch" \
+  --version 1.1.0 \
+  --changelog "Describe this release" \
+  --source-repo hkgood/clawwatch-openclaw-plugin
 ```
 
-Fix any reported issues, then publish without `--dry-run` when ready.
+发布前把 `--version` 改成与 `package.json` 一致；`npx clawhub@latest package publish --help` 以你本机 CLI 为准。
 
 ## Telemetry agent without Gateway
 
