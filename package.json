@@ -1,0 +1,26 @@
+{
+  "name": "clawwatch-openclaw-plugin",
+  "version": "1.0.0",
+  "description": "OpenClaw-side ClawWatch agent: setup, link-token claim, adaptive report to ClawWatch Worker",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "clawwatch-agent": "./src/agent.mjs"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hkgood/clawwatch-openclaw-plugin.git"
+  },
+  "license": "MIT",
+  "keywords": [
+    "clawwatch",
+    "openclaw",
+    "telemetry"
+  ]
+}
