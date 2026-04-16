@@ -43,8 +43,11 @@ npx clawhub@latest package publish . --family code-plugin \
   --display-name "ClawWatch" \
   --version 1.1.0 \
   --changelog "Describe this release" \
-  --source-repo hkgood/clawwatch-openclaw-plugin
+  --source-repo hkgood/clawwatch-openclaw-plugin \
+  --source-commit "$(git rev-parse HEAD)"
 ```
+
+**说明**：当前 ClawHub CLI 要求 **`--source-repo` 与 `--source-commit` 必须同时出现**。`--source-commit` 用当前分支 **`HEAD` 的 SHA**；请先 **`git push`**，确保该提交在 GitHub 上存在，否则校验可能失败。
 
 发布前把 `--version` 改成与 `package.json` 一致；`npx clawhub@latest package publish --help` 以你本机 CLI 为准。
 
