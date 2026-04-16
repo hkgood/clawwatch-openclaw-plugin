@@ -17,6 +17,11 @@ function loadState(p) {
 function saveState(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
+  try {
+    fs.chmodSync(p, 0o600);
+  } catch {
+    /* non-POSIX or permission denied */
+  }
 }
 
 function hmacHex(secret, bodyUtf8) {
