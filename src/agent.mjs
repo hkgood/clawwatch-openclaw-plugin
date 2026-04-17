@@ -6,6 +6,9 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import { execSync } from 'child_process';
+
 const defaultStatePath = () =>
   process.env.CLAWWATCH_STATE || path.join(process.env.HOME || '.', '.clawwatch', 'agent.json');
 
@@ -119,6 +122,63 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// --- Real system metrics for macOS ---
+function getCpuLoad() {
+  try {
+    const cpus = os.cpus();
+    let totalIdle = 0, totalTick = 0;
+    for (const cpu of cpus) {
+      for (const type in cpu.times) {
+        totalTick += cpu.times[type];
+      }
+      totalIdle += cpu.times.idle;
+    }
+    const idle = totalIdle / cpus.length;
+    const total = totalTick / cpus.length;
+    return total > 0 ? Math.round(((total - idle) / total) * 100 * 100) / 100 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function getMemUsage() {
+  try {
+    const total = os.totalmem();
+    const free = os.freemem();
+    const used = total - free;
+    return Math.round((used / 1024 / 1024) * 100) / 100; // MB
+  } catch {
+    return 0;
+  }
+}
+
+function getUptimeSeconds() {
+  return os.uptime();
+}
+
+function getDiskUsage() {
+  try {
+    const out = execSync('df -c / | tail -1', { timeout: 5000 }).toString();
+    const cols = out.trim().split(/\s+/);
+    // cols: Filesystem 512-blocks  Used  Available  Capacity  iused  ifree  %iused  Mounted
+    const used = parseInt(cols[2], 10) * 512;
+    const available = parseInt(cols[3], 10) * 512;
+    return Math.round((used / (used + available)) * 100 * 100) / 100; // percentage
+  } catch {
+    return 0;
+  }
+}
+
+function getVersion() {
+  try {
+    // Try openclaw version first, then node version
+    const out = execSync('openclaw --version 2>/dev/null || node --version', { timeout: 3000 }).toString().trim();
+    return out.replace(/^v/, '');
+  } catch {
+    return process.version.replace(/^v/, '');
+  }
+}
+
 function buildPayloadFromEnv(node_id) {
   let extra = {};
   const raw = process.env.CLAWWATCH_PAYLOAD_JSON;
@@ -132,10 +192,20 @@ function buildPayloadFromEnv(node_id) {
       throw new Error(String(e.message || e));
     }
   } else {
+    const cpuLoad = getCpuLoad();
+    const memUsage = getMemUsage();
+    const uptimeSec = Math.round(getUptimeSeconds());
+    const diskUsage = getDiskUsage();
+    const version = getVersion();
+
     extra = {
       status: 'online',
-      cpu_load: 0,
-      mem_usage: 0,
+      cpu_load: cpuLoad,
+      mem_usage: memUsage,
+      uptime_seconds: uptimeSec,
+      version,
+      disk_usage: diskUsage,
+      // Default tokens to 0; override via CLAWWATCH_PAYLOAD_JSON if needed
       today_tokens: 0,
     };
   }
