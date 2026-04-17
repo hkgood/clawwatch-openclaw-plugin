@@ -158,12 +158,21 @@ function getUptimeSeconds() {
 
 function getDiskUsage() {
   try {
-    const out = execSync('df -c / | tail -1', { timeout: 5000 }).toString();
-    const cols = out.trim().split(/\s+/);
-    // cols: Filesystem 512-blocks  Used  Available  Capacity  iused  ifree  %iused  Mounted
-    const used = parseInt(cols[2], 10) * 512;
-    const available = parseInt(cols[3], 10) * 512;
-    return Math.round((used / (used + available)) * 100 * 100) / 100; // percentage
+    const out = execSync('df -h / | tail -1', { timeout: 5000 }).toString().trim();
+    const cols = out.split(/\s+/);
+    // macOS cols: Filesystem  Size  Used  Avail  Capacity  iused  ifree  %iused  Mounted
+    // Linux cols (df -h):    Filesystem  Size  Used  Avail  Use%  Mounted
+    // Try macOS capacity column first (5th = index 4), then Linux (5th = index 4)
+    const capStr = cols[4]?.replace(/%/g, '');
+    const cap = parseFloat(capStr);
+    if (!isNaN(cap)) return cap;
+    // Fallback: compute from 512-byte blocks (Linux df -k style)
+    const used = parseInt(cols[2], 10);
+    const avail = parseInt(cols[3], 10);
+    if (!isNaN(used) && !isNaN(avail)) {
+      return Math.round((used / (used + avail)) * 10000) / 100;
+    }
+    return 0;
   } catch {
     return 0;
   }
@@ -176,6 +185,45 @@ function getVersion() {
     return out.replace(/^v/, '');
   } catch {
     return process.version.replace(/^v/, '');
+  }
+}
+
+function getIpAddress() {
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        if (iface.internal || iface.family !== 'IPv4') continue;
+        return iface.address;
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function getRegion() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    // Map common timezones to region names
+    if (tz.includes('Shanghai') || tz.includes('Beijing') || tz.includes('Chongqing') || tz.includes('Urumqi')) return 'Asia/Shanghai';
+    if (tz.includes('Tokyo') || tz.includes('Osaka')) return 'Asia/Tokyo';
+    if (tz.includes('Seoul')) return 'Asia/Seoul';
+    if (tz.includes('Los_Angeles') || tz.includes('San_Francisco')) return 'America/Los_Angeles';
+    if (tz.includes('New_York')) return 'America/New_York';
+    if (tz.includes('London')) return 'Europe/London';
+    if (tz.includes('Berlin') || tz.includes('Paris') || tz.includes('Amsterdam')) return 'Europe/Berlin';
+    return tz;
+  } catch {
+    return null;
+  }
+}
+
+function getGpuModel() {
+  try {
+    const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep "Chipset Model" | head -1', { timeout: 5000 }).toString().trim();
+    return out.replace(/^.*:\s*/, '').trim() || null;
+  } catch {
+    return null;
   }
 }
 
@@ -197,6 +245,9 @@ function buildPayloadFromEnv(node_id) {
     const uptimeSec = Math.round(getUptimeSeconds());
     const diskUsage = getDiskUsage();
     const version = getVersion();
+    const ipAddress = getIpAddress();
+    const region = getRegion();
+    const gpuModel = getGpuModel();
 
     extra = {
       status: 'online',
@@ -205,6 +256,9 @@ function buildPayloadFromEnv(node_id) {
       uptime_seconds: uptimeSec,
       version,
       disk_usage: diskUsage,
+      ip_address: ipAddress,
+      region,
+      gpu_model: gpuModel,
       // Default tokens to 0; override via CLAWWATCH_PAYLOAD_JSON if needed
       today_tokens: 0,
     };
