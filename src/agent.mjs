@@ -227,6 +227,59 @@ function getGpuModel() {
   }
 }
 
+function getVramUsage() {
+  try {
+    const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1', { timeout: 5000 }).toString().trim();
+    // e.g. "VRAM (Total): 8192 MB" or "VRAM: 8 GB"
+    const mb = out.match(/(\d+)\s*MB/i)?.[1];
+    if (mb) return parseInt(mb, 10);
+    const gb = out.match(/(\d+)\s*GB/i)?.[1];
+    if (gb) return parseInt(gb, 10) * 1024;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function getGpuLoad() {
+  // On Apple Silicon, GPU is integrated — estimate from cpu_load as fallback.
+  // Ideal: use powermetrics (requires sudo). Try top as non-root approximation.
+  try {
+    // Sample GPU activity from top for 0.5s (non-blocking)
+    const out = execSync('top -l 1 -n 1 -stats gpu 2>/dev/null | grep -i "gpu" | head -1 || echo ""', { timeout: 3000 }).toString().trim();
+    const pct = out.match(/(\d+(?:\.\d+)?)%?/)?.[1];
+    if (pct !== undefined) return parseFloat(pct);
+  } catch { /* ignore */ }
+  return null; // not available without root
+}
+
+function getActiveModel() {
+  // Try to read the active model from OpenClaw environment / runtime state
+  // Check common env vars that might carry model info
+  const model = process.env.OC_MODEL
+    || process.env.ACTIVE_MODEL
+    || process.env.OPENCLAW_MODEL
+    || null;
+  return model;
+}
+
+function getAgentsSummary() {
+  try {
+    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 2000 || echo ""', { timeout: 5000 }).toString().trim();
+    if (!out || out === '[]' || out === '') return null;
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { return null; }
+    if (!Array.isArray(parsed)) return null;
+    return JSON.stringify(parsed.map(a => ({
+      id: a.id || a.agentId,
+      name: a.name || a.displayName || a.id,
+      status: a.status || (a.running ? 'running' : 'idle'),
+    })));
+  } catch {
+    return null;
+  }
+}
+
 function buildPayloadFromEnv(node_id) {
   let extra = {};
   const raw = process.env.CLAWWATCH_PAYLOAD_JSON;
@@ -259,6 +312,11 @@ function buildPayloadFromEnv(node_id) {
       ip_address: ipAddress,
       region,
       gpu_model: gpuModel,
+      gpu_load: getGpuLoad(),
+      vram_usage: getVramUsage(),
+      active_model: getActiveModel(),
+      agents_summary: getAgentsSummary(),
+      api_latency: 0,
       // Default tokens to 0; override via CLAWWATCH_PAYLOAD_JSON if needed
       today_tokens: 0,
     };
@@ -293,8 +351,9 @@ async function cmdRun(baseUrl, statePath) {
       continue;
     }
 
-    const payload = buildPayloadFromEnv(node_id);
-    const body = JSON.stringify(payload);
+    // Build base payload with system metrics
+    const basePayload = buildPayloadFromEnv(node_id);
+    const body = JSON.stringify(basePayload);
     const hash = sha256Hex(body);
     const now = Date.now();
     if (hash === lastHash && now - lastSentAt < dedupeWindowMs) {
@@ -303,7 +362,7 @@ async function cmdRun(baseUrl, statePath) {
     }
 
     try {
-      const rep = await postReport(baseUrl, node_id, node_secret, payload);
+      const rep = await postReport(baseUrl, node_id, node_secret, basePayload);
       lastHash = hash;
       lastSentAt = Date.now();
       const next = rep?.next_interval_sec;
