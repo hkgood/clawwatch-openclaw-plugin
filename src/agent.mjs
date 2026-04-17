@@ -228,29 +228,24 @@ function getGpuModel() {
 }
 
 function getVramUsage() {
+  // Apple M4 uses unified memory — VRAM is shared with system RAM.
+  // Try to parse dedicated VRAM on discrete GPUs (Intel/w dGPU), return null for Apple Silicon.
   try {
     const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1', { timeout: 5000 }).toString().trim();
-    // e.g. "VRAM (Total): 8192 MB" or "VRAM: 8 GB"
     const mb = out.match(/(\d+)\s*MB/i)?.[1];
     if (mb) return parseInt(mb, 10);
     const gb = out.match(/(\d+)\s*GB/i)?.[1];
     if (gb) return parseInt(gb, 10) * 1024;
-    return null;
-  } catch {
-    return null;
-  }
+  } catch { /* ignore */ }
+  return null; // null = unified memory (Apple Silicon) or unavailable
 }
 
 function getGpuLoad() {
-  // On Apple Silicon, GPU is integrated — estimate from cpu_load as fallback.
-  // Ideal: use powermetrics (requires sudo). Try top as non-root approximation.
-  try {
-    // Sample GPU activity from top for 0.5s (non-blocking)
-    const out = execSync('top -l 1 -n 1 -stats gpu 2>/dev/null | grep -i "gpu" | head -1 || echo ""', { timeout: 3000 }).toString().trim();
-    const pct = out.match(/(\d+(?:\.\d+)?)%?/)?.[1];
-    if (pct !== undefined) return parseFloat(pct);
-  } catch { /* ignore */ }
-  return null; // not available without root
+  // Apple Silicon (M-series): GPU is integrated; no user-accessible GPU load without root.
+  // powermetrics requires sudo. top -stats gpu produces no output on macOS.
+  // Estimate: Apple Silicon GPU activity is proportional to overall CPU pressure.
+  // Leave as null to indicate "not measured" — cpu_load is the best proxy.
+  return null;
 }
 
 function getActiveModel() {
@@ -265,8 +260,9 @@ function getActiveModel() {
 
 function getAgentsSummary() {
   try {
-    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 2000 || echo ""', { timeout: 5000 }).toString().trim();
-    if (!out || out === '[]' || out === '') return null;
+    // openclaw CLI may hang if gateway is busy; use short timeout
+    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 2000 || echo ""', { timeout: 3000 }).toString().trim();
+    if (!out || out === '[]' || out === '' || out.includes('error') || out.includes('Error')) return null;
     let parsed;
     try { parsed = JSON.parse(out); } catch { return null; }
     if (!Array.isArray(parsed)) return null;
