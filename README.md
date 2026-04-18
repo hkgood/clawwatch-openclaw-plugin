@@ -147,13 +147,31 @@ Usage: clawwatch-agent <setup|bind|run> --base <workerOrigin> [link_token]
 
 ---
 
-## 环境变量
+## 上报字段清单
 
-| 变量 | 说明 |
-|------|------|
-| `CLAWWATCH_BASE_URL` | Worker 根地址；与 `--base` 二选一（不要尾部 `/`） |
-| `CLAWWATCH_STATE` | 凭据文件路径；默认 `~/.clawwatch/agent.json` |
-| `CLAWWATCH_PAYLOAD_JSON` | JSON **对象**，自定义上报字段；**不要**包含 `node_id`（会自动注入）。未设置时使用内置默认占位字段 |
+本插件默认上报以下字段到 ClawWatch Server：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | string | 节点状态（"online"） |
+| `today_tokens` | number | 今日 token 用量（总计） |
+| `input_tokens` | number | 今日输入 token |
+| `output_tokens` | number | 今日输出 token |
+| `requests_processed` | number | 今日任务请求数（API 调用数） |
+| `requests_failed` | number | 今日失败任务数（错误计数） |
+| `tokens_per_second` | number | Token 速度（今日 token / 运行时间） |
+| `sessions` | number | 总会话数 |
+| `active_sessions` | number | 活跃会话数 |
+| `cpu_load` | number | CPU 负载百分比 |
+| `mem_usage` | number | 内存使用（MB） |
+| `uptime_seconds` | number | 运行时间（秒） |
+| `disk_usage` | number | 磁盘使用百分比 |
+| `active_model` | string | 当前使用的模型 |
+| `version` | string | OpenClaw 版本 |
+| `region` | string | 地理区域 |
+| `ip_address` | string | IP 地址 |
+
+这些字段与 ClawWatchServer 的 `snapshots` 表 schema 完全对应。
 
 ---
 
@@ -225,3 +243,11 @@ node src/agent.mjs
 ## 许可证
 
 MIT
+
+## 环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `CLAWWATCH_BASE_URL` | Worker 根地址；与 `--base` 二选一（不要尾部 `/`） |
+| `CLAWWATCH_STATE` | 凭据文件路径；默认 `~/.clawwatch/agent.json` |
+| `CLAWWATCH_PAYLOAD_JSON` | JSON **对象**，自定义上报字段；**不要**包含 `node_id`（会自动注入）。未设置时使用内置默认占位字段 |

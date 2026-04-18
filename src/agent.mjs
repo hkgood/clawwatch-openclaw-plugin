@@ -258,6 +258,86 @@ function getActiveModel() {
   return model;
 }
 
+// 从 session transcript 解析今日 token 使用量
+function getTodayTokenStats() {
+  const now = Date.now();
+  const msPerDay = 86_400_000;
+  const utc8OffsetMs = 8 * 3_600_000;
+  const todayStartMs = Math.floor((now - utc8OffsetMs) / msPerDay) * msPerDay + utc8OffsetMs;
+
+  let freshInput = 0, freshOutput = 0, apiCalls = 0, errorCount = 0, activeSessions = 0;
+
+  const agentsDir = path.join(process.env.HOME || '', '.openclaw', 'agents');
+  if (!fs.existsSync(agentsDir)) {
+    return { todayTokens: 0, inputTokens: 0, outputTokens: 0, apiCalls: 0, errorCount: 0, activeSessions: 0 };
+  }
+
+  try {
+    const agentIds = fs.readdirSync(agentsDir);
+    for (const agentId of agentIds) {
+      const sessionsDir = path.join(agentsDir, agentId, 'sessions');
+      if (!fs.existsSync(sessionsDir)) continue;
+
+      const files = fs.readdirSync(sessionsDir).filter(f =>
+        f.endsWith('.jsonl') && !f.includes('.checkpoint.') && !f.includes('.deleted.') && !f.includes('.reset.')
+      );
+
+      for (const file of files) {
+        const fp = path.join(sessionsDir, file);
+        try {
+          const stat = fs.statSync(fp);
+          if (stat.mtimeMs < todayStartMs) continue;
+
+          const content = fs.readFileSync(fp, 'utf8');
+          const lines = content.split('\n').filter(l => l.trim() && l !== '[' && l !== ']');
+
+          for (const line of lines) {
+            try {
+              const obj = JSON.parse(line.replace(/,$/, '').trim());
+              if (obj?.type === 'error') { errorCount++; continue; }
+              if (obj?.message?.usage) {
+                const u = obj.message.usage;
+                freshInput += u.input || 0;
+                freshOutput += u.output || 0;
+                apiCalls++;
+              }
+              activeSessions++;
+            } catch { /* skip malformed lines */ }
+          }
+        } catch { /* skip unreadable files */ }
+      }
+    }
+  } catch { /* ignore */ }
+
+  return {
+    todayTokens: freshInput + freshOutput,
+    inputTokens: freshInput,
+    outputTokens: freshOutput,
+    apiCalls,
+    errorCount,
+    activeSessions
+  };
+}
+
+// 获取会话数
+function getSessionsCount() {
+  const agentsDir = path.join(process.env.HOME || '', '.openclaw', 'agents');
+  if (!fs.existsSync(agentsDir)) return 0;
+
+  let total = 0;
+  try {
+    const agentIds = fs.readdirSync(agentsDir);
+    for (const agentId of agentIds) {
+      const sp = path.join(agentsDir, agentId, 'sessions', 'sessions.json');
+      if (fs.existsSync(sp)) {
+        const obj = JSON.parse(fs.readFileSync(sp, 'utf8'));
+        total += Object.keys(obj).length;
+      }
+    }
+  } catch { /* ignore */ }
+  return total;
+}
+
 function getAgentsSummary() {
   try {
     // openclaw CLI may hang if gateway is busy; use short timeout
@@ -313,8 +393,15 @@ function buildPayloadFromEnv(node_id) {
       active_model: getActiveModel(),
       agents_summary: getAgentsSummary(),
       api_latency: 0,
-      // Default tokens to 0; override via CLAWWATCH_PAYLOAD_JSON if needed
-      today_tokens: 0,
+      // Token stats from transcript parsing
+      today_tokens: getTodayTokenStats().todayTokens,
+      input_tokens: getTodayTokenStats().inputTokens,
+      output_tokens: getTodayTokenStats().outputTokens,
+      requests_processed: getTodayTokenStats().apiCalls,
+      requests_failed: getTodayTokenStats().errorCount,
+      tokens_per_second: uptimeSec > 0 ? Math.round((getTodayTokenStats().todayTokens / uptimeSec) * 100) / 100 : 0,
+      sessions: getSessionsCount(),
+      active_sessions: getTodayTokenStats().activeSessions,
     };
   }
   return { node_id, ...extra };
