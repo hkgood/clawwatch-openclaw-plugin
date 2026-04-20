@@ -149,29 +149,36 @@ Usage: clawwatch-agent <setup|bind|run> --base <workerOrigin> [link_token]
 
 ## 上报字段清单
 
-本插件默认上报以下字段到 ClawWatch Server：
+### 插件 JSON 里会出现的键（`buildPayloadFromEnv` / `CLAWWATCH_PAYLOAD_JSON`）
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `status` | string | 节点状态（"online"） |
-| `today_tokens` | number | 今日 token 用量（总计） |
-| `input_tokens` | number | 今日输入 token |
-| `output_tokens` | number | 今日输出 token |
-| `requests_processed` | number | 今日任务请求数（API 调用数） |
-| `requests_failed` | number | 今日失败任务数（错误计数） |
-| `tokens_per_second` | number | Token 速度（今日 token / 运行时间） |
-| `sessions` | number | 总会话数 |
-| `active_sessions` | number | 活跃会话数 |
-| `cpu_load` | number | CPU 负载百分比 |
-| `mem_usage` | number | 内存使用（MB） |
-| `uptime_seconds` | number | 运行时间（秒） |
-| `disk_usage` | number | 磁盘使用百分比 |
-| `active_model` | string | 当前使用的模型 |
-| `version` | string | OpenClaw 版本 |
-| `region` | string | 地理区域 |
-| `ip_address` | string | IP 地址 |
+下表区分 **Worker 会写入 D1 `snapshots` 的列**、**只更新 `nodes` 元数据**、以及 **当前不入库（由 Worker 忽略）** 的键，避免与「表结构一一对应」混淆。
 
-这些字段与 ClawWatchServer 的 `snapshots` 表 schema 完全对应。
+| 字段 | 类型 | 说明 | Worker / D1 |
+|------|------|------|----------------|
+| `node_id` | string | 节点 ID（必填） | 用于路由，不写 `snapshots` 列 |
+| `status` | string | 如 `"online"` | `snapshots.status` |
+| `today_tokens` | number | 今日 token 总计 | `snapshots.today_tokens` |
+| `input_tokens` | number | 今日输入 token | `snapshots.input_tokens` |
+| `output_tokens` | number | 今日输出 token | `snapshots.output_tokens` |
+| `sessions` | number | 总会话数（也可用 `session_count`） | `snapshots.session_count` |
+| `active_sessions` | number | 活跃会话（也可用 `active_session_count`） | `snapshots.active_session_count` |
+| `requests_processed` | number | 今日请求/调用计数 | `snapshots.requests_processed` |
+| `requests_failed` | number | 失败计数 | `snapshots.requests_failed` |
+| `tokens_per_second` | number | 今日 token ÷ 运行时间 | `snapshots.tokens_per_second` |
+| `cpu_load` | number | CPU 负载 % | `snapshots.cpu_load` |
+| `mem_usage` | number | 内存 MB | `snapshots.mem_usage` |
+| `gpu_load` | number | GPU 负载 % | `snapshots.gpu_load` |
+| `vram_usage` | number | 显存用量 | `snapshots.vram_usage` |
+| `disk_usage` | number | 磁盘使用 % | `snapshots.disk_usage` |
+| `uptime_seconds` | number | 运行时间（秒） | `snapshots.uptime_seconds` |
+| `api_latency` | number | 到 Worker 的 RTT（ms），测不到时可省略 | `snapshots.api_latency` |
+| `active_model` | string | 当前模型 | `snapshots.active_model` |
+| `agents_summary` | string 或数组 | 多 Agent 摘要 JSON | `snapshots.agents_summary`（TEXT） |
+| `task_status` / `task_desc` / `step_progress` / `need_approval` | 混合 | 任务与审批态（若 `openclaw status --json` 可解析） | 对应 `snapshots` 列 |
+| `daily_cost` / `token_usage` / `api_balance` | number | 成本类（可选自定义上报） | 对应列 |
+| `version` / `ip_address` / `region` / `gpu_model` | string | 节点环境 | **`nodes` 表**，非 `snapshots` |
+
+未列出的键仍会出现在签名的 JSON body 中，但 **Worker 不会写入 D1**；自定义字段请通过 `CLAWWATCH_PAYLOAD_JSON` 只使用上表已支持列，或扩展 Server 后再用。
 
 ---
 
@@ -251,3 +258,5 @@ MIT
 | `CLAWWATCH_BASE_URL` | Worker 根地址；与 `--base` 二选一（不要尾部 `/`） |
 | `CLAWWATCH_STATE` | 凭据文件路径；默认 `~/.clawwatch/agent.json` |
 | `CLAWWATCH_PAYLOAD_JSON` | JSON **对象**，自定义上报字段；**不要**包含 `node_id`（会自动注入）。未设置时使用内置默认占位字段 |
+
+**延迟与 OpenClaw 状态**：`run` 循环在每次上报前会对 `GET {base}/api/v1/config` 测 RTT，写入 `api_latency`（毫秒）。若本机存在 `openclaw status --json`，会尝试解析并合并 `task_status` / `task_desc` / `step_progress` / `need_approval` 及队列深度等字段（均为尽力而为，CLI 不可用时静默跳过）。

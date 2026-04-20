@@ -338,19 +338,116 @@ function getSessionsCount() {
   return total;
 }
 
+function truncateAgentField(v, max) {
+  if (v == null) return undefined;
+  const s = String(v).trim();
+  if (!s) return undefined;
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+/** 与 docs/ARCHITECTURE §9.1 对齐的轻量摘要；控制条数与字段长度以便 Worker 截断前尽量小。 */
 function getAgentsSummary() {
   try {
-    // openclaw CLI may hang if gateway is busy; use short timeout
-    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 2000 || echo ""', { timeout: 3000 }).toString().trim();
-    if (!out || out === '[]' || out === '' || out.includes('error') || out.includes('Error')) return null;
+    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 12000 || echo ""', { timeout: 3000 }).toString().trim();
+    if (!out || out === '[]' || out === '' || out.toLowerCase().includes('error')) return null;
     let parsed;
-    try { parsed = JSON.parse(out); } catch { return null; }
+    try {
+      parsed = JSON.parse(out);
+    } catch {
+      return null;
+    }
     if (!Array.isArray(parsed)) return null;
-    return JSON.stringify(parsed.map(a => ({
-      id: a.id || a.agentId,
-      name: a.name || a.displayName || a.id,
-      status: a.status || (a.running ? 'running' : 'idle'),
-    })));
+    const rows = parsed.slice(0, 16).map((a) => {
+      const sessions =
+        typeof a.sessions === 'number'
+          ? a.sessions
+          : typeof a.sessionCount === 'number'
+            ? a.sessionCount
+            : undefined;
+      const lastActive =
+        a.last_active_at ||
+        a.lastActiveAt ||
+        a.updatedAt ||
+        a.lastSeen ||
+        a.lastActivity;
+      const storeRaw = a.store_path_summary || a.storePathSummary || a.storePath || a.store || a.path;
+      let bootstrapMissing;
+      if (typeof a.bootstrap_missing === 'boolean') bootstrapMissing = a.bootstrap_missing;
+      else if (typeof a.bootstrapMissing === 'boolean') bootstrapMissing = a.bootstrapMissing;
+      else if (typeof a.bootstrap === 'boolean') bootstrapMissing = !a.bootstrap;
+      const workState = a.work_state || a.workState || a.state;
+      const status =
+        typeof a.status === 'string' && a.status.trim()
+          ? a.status.trim()
+          : a.running === true
+            ? 'running'
+            : a.running === false
+              ? 'idle'
+              : undefined;
+      return {
+        id: a.id || a.agentId || undefined,
+        name: a.name || a.displayName || a.id || a.agentId,
+        status,
+        sessions,
+        last_active_at: lastActive != null ? String(lastActive).slice(0, 200) : undefined,
+        store_path_summary: truncateAgentField(storeRaw, 160),
+        bootstrap_missing: bootstrapMissing,
+        work_state: workState != null ? String(workState).slice(0, 120) : undefined,
+      };
+    });
+    return JSON.stringify(rows);
+  } catch {
+    return null;
+  }
+}
+
+/** 解析 `openclaw status --json`（若存在）填充 task_* / need_approval；失败则返回空对象。 */
+function tryOpenClawStatusFields() {
+  try {
+    const out = execSync('openclaw status --json 2>/dev/null', {
+      encoding: 'utf8',
+      timeout: 2500,
+      maxBuffer: 512 * 1024,
+    }).trim();
+    if (!out || out[0] !== '{') return {};
+    const j = JSON.parse(out);
+    const r = {};
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
+
+    const na = num(j.need_approval ?? j.needApproval ?? j.pending_approvals);
+    if (na != null) r.need_approval = na;
+
+    const ts = j.task_status ?? j.taskStatus;
+    if (typeof ts === 'string' && ts.trim()) r.task_status = ts.trim().slice(0, 120);
+
+    const td = j.task_desc ?? j.taskDesc ?? j.task ?? j.summary?.line ?? j.active_task;
+    if (typeof td === 'string' && td.trim()) r.task_desc = td.trim().slice(0, 500);
+
+    const sp = j.step_progress ?? j.stepProgress;
+    if (typeof sp === 'string' && sp.trim()) r.step_progress = sp.trim().slice(0, 120);
+
+    const qd = num(j.queue_depth ?? j.queueDepth ?? j.queue?.depth);
+    if (qd != null) {
+      if (!r.task_status) r.task_status = 'queue';
+      if (!r.task_desc) r.task_desc = `depth ${qd}`;
+    }
+    return r;
+  } catch {
+    return {};
+  }
+}
+
+/** Worker `GET /api/v1/config` 往返时延（ms），用于填充 `api_latency`；失败返回 null。 */
+async function measureWorkerLatencyMs(baseUrl) {
+  const root = String(baseUrl || '').replace(/\/$/, '');
+  if (!root) return null;
+  const url = `${root}/api/v1/config`;
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
+    await res.text();
+    if (!res.ok) return null;
+    return Math.max(0, Math.round(Date.now() - t0));
   } catch {
     return null;
   }
@@ -392,7 +489,6 @@ function buildPayloadFromEnv(node_id) {
       vram_usage: getVramUsage(),
       active_model: getActiveModel(),
       agents_summary: getAgentsSummary(),
-      api_latency: 0,
       // Token stats from transcript parsing
       today_tokens: getTodayTokenStats().todayTokens,
       input_tokens: getTodayTokenStats().inputTokens,
@@ -434,8 +530,11 @@ async function cmdRun(baseUrl, statePath) {
       continue;
     }
 
-    // Build base payload with system metrics
+    // Build base payload with system metrics + Worker RTT + OpenClaw status（若 CLI 可用）
     const basePayload = buildPayloadFromEnv(node_id);
+    const latMs = await measureWorkerLatencyMs(baseUrl);
+    if (latMs != null) basePayload.api_latency = latMs;
+    Object.assign(basePayload, tryOpenClawStatusFields());
     const body = JSON.stringify(basePayload);
     const hash = sha256Hex(body);
     const now = Date.now();
