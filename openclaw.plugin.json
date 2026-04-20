@@ -9,6 +9,10 @@
       "state_path": {
         "type": "string",
         "description": "Optional path to agent state JSON. Default: ~/.clawwatch/agent.json (or CLAWWATCH_STATE)."
+      },
+      "worker_base_url": {
+        "type": "string",
+        "description": "ClawWatch Worker base URL (no trailing slash required). Default: https://cw.osglab.win — override for self-hosted Workers."
       }
     }
   }

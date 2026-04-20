@@ -6,8 +6,8 @@ import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** 固定 ClawWatch Worker 根地址（与 iOS / 官方节点默认一致）。 */
-const CLAWWATCH_WORKER_BASE_URL = 'https://cw.osglab.win';
+/** 默认 ClawWatch Worker 根地址（与 iOS `ClawWatchConstants.workerBaseURL` 一致）。 */
+const DEFAULT_CLAWWATCH_WORKER_BASE_URL = 'https://cw.osglab.win';
 
 const pluginManifest = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', 'openclaw.plugin.json'), 'utf8'),
@@ -15,6 +15,8 @@ const pluginManifest = JSON.parse(
 
 type ClawWatchPluginConfig = {
   state_path?: string;
+  /** Self-hosted Worker override; default matches iOS `ClawWatchConstants.workerBaseURL`. */
+  worker_base_url?: string;
 };
 
 function resolveAgentScript(rootDir: string | undefined): string {
@@ -36,7 +38,11 @@ export default definePluginEntry({
   configSchema: pluginManifest.configSchema,
   register(api) {
     const cfg = (api.pluginConfig ?? {}) as ClawWatchPluginConfig;
-    const base = normalizeBase(CLAWWATCH_WORKER_BASE_URL);
+    const configured =
+      typeof cfg.worker_base_url === 'string' && cfg.worker_base_url.trim()
+        ? cfg.worker_base_url.trim()
+        : DEFAULT_CLAWWATCH_WORKER_BASE_URL;
+    const base = normalizeBase(configured);
 
     api.registerService({
       id: `${api.id}.telemetry-agent`,
