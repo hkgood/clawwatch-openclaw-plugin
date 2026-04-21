@@ -265,11 +265,13 @@ function getTodayTokenStats() {
   const utc8OffsetMs = 8 * 3_600_000;
   const todayStartMs = Math.floor((now - utc8OffsetMs) / msPerDay) * msPerDay + utc8OffsetMs;
 
-  let freshInput = 0, freshOutput = 0, apiCalls = 0, errorCount = 0, activeSessions = 0;
+  let freshInput = 0, freshOutput = 0, apiCalls = 0, errorCount = 0;
+  // 修复：使用 Set 统计今日有活动的独立 session 数
+  const todayActiveSessionIds = new Set();
 
   const agentsDir = path.join(process.env.HOME || '', '.openclaw', 'agents');
   if (!fs.existsSync(agentsDir)) {
-    return { todayTokens: 0, inputTokens: 0, outputTokens: 0, apiCalls: 0, errorCount: 0, activeSessions: 0 };
+    return { todayTokens: 0, inputTokens: 0, outputTokens: 0, apiCalls: 0, errorCount: 0, activeSessionCount: 0 };
   }
 
   try {
@@ -295,13 +297,14 @@ function getTodayTokenStats() {
             try {
               const obj = JSON.parse(line.replace(/,$/, '').trim());
               if (obj?.type === 'error') { errorCount++; continue; }
+              // 收集 sessionId 用于统计真正的活跃会话数
+              if (obj?.sessionId) todayActiveSessionIds.add(obj.sessionId);
               if (obj?.message?.usage) {
                 const u = obj.message.usage;
                 freshInput += u.input || 0;
                 freshOutput += u.output || 0;
                 apiCalls++;
               }
-              activeSessions++;
             } catch { /* skip malformed lines */ }
           }
         } catch { /* skip unreadable files */ }
@@ -315,7 +318,7 @@ function getTodayTokenStats() {
     outputTokens: freshOutput,
     apiCalls,
     errorCount,
-    activeSessions
+    activeSessionCount: todayActiveSessionIds.size
   };
 }
 
@@ -343,6 +346,83 @@ function truncateAgentField(v, max) {
   const s = String(v).trim();
   if (!s) return undefined;
   return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+/**
+ * 从 `openclaw status --json` 解析 sessions 块，提取 Context 使用率和 Cache 命中率等全局统计。
+ */
+function getOpenClawStatusStats() {
+  try {
+    const out = execSync('openclaw status --json 2>/dev/null', {
+      encoding: 'utf8',
+      timeout: 2500,
+      maxBuffer: 512 * 1024,
+    }).trim();
+    if (!out || out[0] !== '{') return {};
+    const j = JSON.parse(out);
+
+    const byAgent = j.sessions?.byAgent;
+    if (!Array.isArray(byAgent) || byAgent.length === 0) return {};
+
+    // 收集所有 recent session 的数据
+    let totalPercentUsed = 0;
+    let totalCacheRead = 0;
+    let totalTotalTokens = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let sessionCount = 0;
+    let contextLimit = null;
+    const contextLimits = {};
+
+    for (const agent of byAgent) {
+      const recent = agent.recent;
+      if (!Array.isArray(recent)) continue;
+      for (const s of recent) {
+        // percentUsed: 最近一次 context 使用百分比
+        if (typeof s.percentUsed === 'number' && s.percentUsed > 0) {
+          totalPercentUsed += s.percentUsed;
+          sessionCount++;
+        }
+        // cache: cacheRead / totalTokens 作为命中率
+        if (typeof s.cacheRead === 'number' && typeof s.totalTokens === 'number' && s.totalTokens > 0) {
+          totalCacheRead += s.cacheRead;
+          totalTotalTokens += s.totalTokens;
+        }
+        // input/output tokens from recent session (most authoritative)
+        if (typeof s.inputTokens === 'number') totalInputTokens += s.inputTokens;
+        if (typeof s.outputTokens === 'number') totalOutputTokens += s.outputTokens;
+        // context limit: most common value across agents
+        if (typeof s.contextTokens === 'number' && s.contextTokens > 0) {
+          contextLimits[s.contextTokens] = (contextLimits[s.contextTokens] || 0) + 1;
+        }
+      }
+    }
+
+    // 取出现次数最多的 contextLimit
+    if (Object.keys(contextLimits).length > 0) {
+      contextLimit = parseInt(
+        Object.entries(contextLimits).sort((a, b) => b[1] - a[1])[0][0],
+        10
+      );
+    }
+
+    const avgPercentUsed = sessionCount > 0 ? Math.round(totalPercentUsed / sessionCount) : null;
+    const cacheHitRate = totalTotalTokens > 0
+      ? Math.round((totalCacheRead / totalTotalTokens) * 100)
+      : null;
+
+    return {
+      context_percent: avgPercentUsed,
+      context_limit: contextLimit,
+      cache_hit_rate: cacheHitRate,
+      // 从 status JSON 的 sessions 提取 input/output tokens
+      // 覆盖 jsonl 解析的粗略值（更准确，因为是实时状态）
+      _inputTokensFromStatus: totalInputTokens,
+      _outputTokensFromStatus: totalOutputTokens,
+    };
+  } catch {
+    return {};
+  }
 }
 
 /** 与 docs/ARCHITECTURE §9.1 对齐的轻量摘要；控制条数与字段长度以便 Worker 截断前尽量小。 */
@@ -475,6 +555,10 @@ function buildPayloadFromEnv(node_id) {
     const region = getRegion();
     const gpuModel = getGpuModel();
 
+    // 从 openclaw status --json 解析 sessions 块（更准确的实时数据）
+    const statusStats = getOpenClawStatusStats();
+    const tokenStats = getTodayTokenStats();
+
     extra = {
       status: 'online',
       cpu_load: cpuLoad,
@@ -489,15 +573,19 @@ function buildPayloadFromEnv(node_id) {
       vram_usage: getVramUsage(),
       active_model: getActiveModel(),
       agents_summary: getAgentsSummary(),
-      // Token stats from transcript parsing
-      today_tokens: getTodayTokenStats().todayTokens,
-      input_tokens: getTodayTokenStats().inputTokens,
-      output_tokens: getTodayTokenStats().outputTokens,
-      requests_processed: getTodayTokenStats().apiCalls,
-      requests_failed: getTodayTokenStats().errorCount,
-      tokens_per_second: uptimeSec > 0 ? Math.round((getTodayTokenStats().todayTokens / uptimeSec) * 100) / 100 : 0,
+      // Token stats：优先用 status JSON 的实时数据，fallback 到 jsonl 解析
+      today_tokens: (statusStats._inputTokensFromStatus + statusStats._outputTokensFromStatus) || tokenStats.todayTokens,
+      input_tokens: statusStats._inputTokensFromStatus || tokenStats.inputTokens,
+      output_tokens: statusStats._outputTokensFromStatus || tokenStats.outputTokens,
+      requests_processed: tokenStats.apiCalls,
+      requests_failed: tokenStats.errorCount,
+      tokens_per_second: uptimeSec > 0 ? Math.round((tokenStats.todayTokens / uptimeSec) * 100) / 100 : 0,
       sessions: getSessionsCount(),
-      active_sessions: getTodayTokenStats().activeSessions,
+      active_sessions: tokenStats.activeSessionCount,
+      // 新增：Context 使用率和 Cache 命中率
+      context_percent: statusStats.context_percent ?? null,
+      context_limit: statusStats.context_limit ?? null,
+      cache_hit_rate: statusStats.cache_hit_rate ?? null,
     };
   }
   return { node_id, ...extra };
