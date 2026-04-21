@@ -367,10 +367,12 @@ function getOpenClawStatusStats() {
     // 收集所有 recent session 的数据
     let totalPercentUsed = 0;
     let totalCacheRead = 0;
-    let totalTotalTokens = 0;
+    let totalCacheWrite = 0;
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let sessionCount = 0;
+    let cacheSessionCount = 0;
+    let cacheHitRateSum = 0;
     let contextLimit = null;
     const contextLimits = {};
 
@@ -383,10 +385,15 @@ function getOpenClawStatusStats() {
           totalPercentUsed += s.percentUsed;
           sessionCount++;
         }
-        // cache: cacheRead / totalTokens 作为命中率
+        // cache: 缓存读取量和写入量（绝对值），命中率取各 session 命中率均值
         if (typeof s.cacheRead === 'number' && typeof s.totalTokens === 'number' && s.totalTokens > 0) {
           totalCacheRead += s.cacheRead;
-          totalTotalTokens += s.totalTokens;
+          totalCacheWrite += s.cacheWrite || 0;
+          // 单 session 命中率 = cacheRead / (cacheRead + newTokens)，避免跨 session 累加失真
+          const newTokens = Math.max(0, s.totalTokens - (s.cacheRead > s.totalTokens ? s.totalTokens : s.cacheRead));
+          const sessionHitRate = s.totalTokens > 0 ? Math.round((s.cacheRead / s.totalTokens) * 100) : 0;
+          cacheHitRateSum += sessionHitRate;
+          cacheSessionCount++;
         }
         // input/output tokens from recent session (most authoritative)
         if (typeof s.inputTokens === 'number') totalInputTokens += s.inputTokens;
@@ -407,18 +414,19 @@ function getOpenClawStatusStats() {
     }
 
     const avgPercentUsed = sessionCount > 0 ? Math.round(totalPercentUsed / sessionCount) : null;
-    const cacheHitRate = totalTotalTokens > 0
-      ? Math.round((totalCacheRead / totalTotalTokens) * 100)
-      : null;
+    const avgCacheHitRate = cacheSessionCount > 0 ? Math.round(cacheHitRateSum / cacheSessionCount) : null;
 
     return {
       context_percent: avgPercentUsed,
       context_limit: contextLimit,
-      cache_hit_rate: cacheHitRate,
+      cache_hit_rate: avgCacheHitRate,
       // 从 status JSON 的 sessions 提取 input/output tokens
       // 覆盖 jsonl 解析的粗略值（更准确，因为是实时状态）
       _inputTokensFromStatus: totalInputTokens,
       _outputTokensFromStatus: totalOutputTokens,
+      // 缓存绝对值（字节），供 iOS 展示 "Xk cached, Xk new"
+      _cacheRead: totalCacheRead,
+      _cacheWrite: totalCacheWrite,
     };
   } catch {
     return {};
@@ -586,6 +594,9 @@ function buildPayloadFromEnv(node_id) {
       context_percent: statusStats.context_percent ?? null,
       context_limit: statusStats.context_limit ?? null,
       cache_hit_rate: statusStats.cache_hit_rate ?? null,
+      // 缓存绝对值（字节），供 iOS 展示 "Xk cached, Xk new"
+      cache_read: statusStats._cacheRead ?? null,
+      cache_write: statusStats._cacheWrite ?? null,
     };
   }
   return { node_id, ...extra };
