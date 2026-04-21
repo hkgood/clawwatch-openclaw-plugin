@@ -1,6 +1,6 @@
 {
   "name": "clawwatch-openclaw-plugin",
-  "version": "1.3.10",
+  "version": "1.3.11",
   "description": "OpenClaw plugin + CLI: ClawWatch node agent (setup, bind, adaptive report to ClawWatch Worker)",
   "type": "module",
   "main": "./dist/index.js",
