@@ -568,6 +568,7 @@ function buildPayloadFromEnv(node_id) {
     const tokenStats = getTodayTokenStats();
 
     extra = {
+      node_name: os.hostname(),
       status: 'online',
       cpu_load: cpuLoad,
       mem_usage: memUsage,
