@@ -1,31 +1,117 @@
 #!/usr/bin/env node
 /**
  * ClawWatch node agent — setup / bind (link_token) / adaptive run loop.
- * Uses the same HMAC rules as ClawWatchServer README: sign the exact JSON body bytes.
+ *
+ * Key design principles:
+ * - No exec of openclaw CLI (incompatible with收紧权限的新版OpenClaw)
+ * - All data read from local files (agents dir, sessions, openclaw.json)
+ * - Local diff before report: skip if payload unchanged (dedupe自然成立)
+ * - TTL cache with disk persistence (survives in-memory cache expiry)
+ * - All field comparisons done locally; server receives complete payload
  */
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
+import crypto from 'node:fs';
+import fs from 'node:fs';
+import path from 'node:path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 
 const defaultStatePath = () =>
   process.env.CLAWWATCH_STATE || path.join(process.env.HOME || '.', '.clawwatch', 'agent.json');
 
+const defaultCachePath = () =>
+  path.join(process.env.HOME || '.', '.clawwatch', 'agent_cache.json');
+
+// ─── State & Cache helpers ───────────────────────────────────────────────────
+
 function loadState(p) {
-  const raw = fs.readFileSync(p, 'utf8');
-  return JSON.parse(raw);
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
 
 function saveState(p, data) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
-  try {
-    fs.chmodSync(p, 0o600);
-  } catch {
-    /* non-POSIX or permission denied */
+  try { fs.chmodSync(p, 0o600); } catch { /* non-POSIX */ }
+}
+
+/**
+ * TTL cache persisted to disk.
+ * - Cache is read from disk on startup (survives process restart)
+ * - Each entry: { value, expiresAt }
+ */
+class TtlCache {
+  constructor(filePath, defaultTtlMs = 60_000) {
+    this.filePath = filePath;
+    this.defaultTtl = defaultTtlMs;
+    this.data = {};
+    this._loaded = false;
+  }
+
+  _loadSync() {
+    if (this._loaded) return;
+    this._loaded = true;
+    try {
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      this.data = JSON.parse(raw);
+    } catch { this.data = {}; }
+  }
+
+  _persistSync() {
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
+    } catch { /* ignore */ }
+  }
+
+  /** Get cached value, or null if absent/expired. */
+  get(key) {
+    this._loadSync();
+    const entry = this.data[key];
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      delete this.data[key];
+      return null;
+    }
+    return entry.value;
+  }
+
+  /** Set value with optional custom TTL (ms). */
+  set(key, value, ttlMs) {
+    this._loadSync();
+    this.data[key] = { value, expiresAt: Date.now() + (ttlMs ?? this.defaultTtl) };
+    this._persistSync();
+  }
+
+  /** Invalidate a key immediately. */
+  del(key) {
+    this._loadSync();
+    delete this.data[key];
+    this._persistSync();
   }
 }
+
+// Global field cache (60s TTL, persisted to disk)
+const fieldCache = new TtlCache(defaultCachePath(), 60_000);
+
+// Last successfully reported payload (for diff comparison)
+let lastPayload = null;
+const lastPayloadPath = () =>
+  path.join(process.env.HOME || '.', '.clawwatch', 'last_payload.json');
+
+function loadLastPayload() {
+  try {
+    lastPayload = JSON.parse(fs.readFileSync(lastPayloadPath(), 'utf8'));
+  } catch { lastPayload = null; }
+}
+
+function saveLastPayload(payload) {
+  try {
+    fs.mkdirSync(path.dirname(lastPayloadPath()), { recursive: true });
+    fs.writeFileSync(lastPayloadPath(), JSON.stringify(payload, 'utf8'));
+  } catch { /* ignore */ }
+}
+
+// ─── Crypto helpers ───────────────────────────────────────────────────────────
 
 function hmacHex(secret, bodyUtf8) {
   return crypto.createHmac('sha256', secret).update(bodyUtf8, 'utf8').digest('hex');
@@ -35,33 +121,28 @@ function sha256Hex(s) {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 }
 
+// ─── Argument parsing ─────────────────────────────────────────────────────────
+
 function parseArgs(argv) {
   const out = { cmd: null, base: null, positional: [] };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--base' && argv[i + 1]) {
-      out.base = argv[++i].replace(/\/$/, '');
-    } else if (a.startsWith('--base=')) {
-      out.base = a.slice('--base='.length).replace(/\/$/, '');
-    } else if (a === 'setup' || a === 'bind' || a === 'run') {
-      out.cmd = a;
-    } else if (!a.startsWith('-')) {
-      out.positional.push(a);
-    }
+    if (a === '--base' && argv[i + 1]) { out.base = argv[++i].replace(/\/$/, ''); }
+    else if (a.startsWith('--base=')) { out.base = a.slice('--base='.length).replace(/\/$/, ''); }
+    else if (a === 'setup' || a === 'bind' || a === 'run') { out.cmd = a; }
+    else if (!a.startsWith('-')) { out.positional.push(a); }
   }
   if (!out.base) out.base = process.env.CLAWWATCH_BASE_URL?.replace(/\/$/, '') || null;
   return out;
 }
 
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+
 async function fetchJson(url, opts = {}) {
   const res = await fetch(url, opts);
   const text = await res.text();
   let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = { _raw: text };
-  }
+  try { json = text ? JSON.parse(text) : null; } catch { json = { _raw: text }; }
   if (!res.ok) {
     const msg = json?.error || text || res.statusText;
     throw new Error(`${res.status} ${msg}`);
@@ -83,14 +164,12 @@ async function cmdSetup(baseUrl, statePath) {
 
 async function cmdBind(baseUrl, statePath, linkToken) {
   const st = loadState(statePath);
-  const node_id = st.node_id;
-  const node_secret = st.node_secret;
+  const { node_id, node_secret } = st;
   if (!node_id || !node_secret) throw new Error('Invalid state file; run setup first');
   const bodyObj = { node_id, link_token: linkToken.trim() };
   const body = JSON.stringify(bodyObj);
   const sig = hmacHex(node_secret, body);
-  const url = `${baseUrl}/api/v1/agent/claim`;
-  await fetchJson(url, {
+  await fetchJson(`${baseUrl}/api/v1/agent/claim`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-signature': sig },
     body,
@@ -118,81 +197,99 @@ async function postReport(baseUrl, node_id, node_secret, payload) {
   });
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// --- Real system metrics for macOS ---
+// ─── System metrics (no exec required) ───────────────────────────────────────
+
+/**
+ * Cross-platform CPU load:
+ * - macOS:   top -l 1 -n 2 (second sample is accurate)
+ * - Linux:   /proc/stat
+ * - Windows/other: null (unavailable)
+ */
 function getCpuLoad() {
-  try {
-    const cpus = os.cpus();
-    let totalIdle = 0, totalTick = 0;
-    for (const cpu of cpus) {
-      for (const type in cpu.times) {
-        totalTick += cpu.times[type];
+  if (process.platform === 'darwin') {
+    try {
+      // -n 2 gives us two samples; the second is the recent average
+      const out = execSync('top -l 1 -n 2', { timeout: 4000, encoding: 'utf8', maxBuffer: 4096 });
+      const lines = out.split('\n');
+      // macOS CPU line format: "CPU usage: X% user, Y% sys, Z% idle"
+      const cpuLine = lines.find(l => l.includes('CPU usage') || l.includes('CPU:'));
+      if (!cpuLine) return null;
+      const userMatch = cpuLine.match(/(\d+\.?\d*)% user/);
+      const sysMatch = cpuLine.match(/(\d+\.?\d*)% sys/);
+      if (userMatch && sysMatch) {
+        return Math.round((parseFloat(userMatch[1]) + parseFloat(sysMatch[1])) * 100) / 100;
       }
-      totalIdle += cpu.times.idle;
-    }
-    const idle = totalIdle / cpus.length;
-    const total = totalTick / cpus.length;
-    return total > 0 ? Math.round(((total - idle) / total) * 100 * 100) / 100 : 0;
-  } catch {
-    return 0;
+      // Fallback pattern: "X%Y%"
+      const m = cpuLine.match(/(\d+\.?\d*)%/g);
+      if (m && m.length >= 2) {
+        // Usually: [user%, sys%, idle%] or [user%, idle%]
+        // Find idle% to subtract
+        const idleMatch = cpuLine.match(/(\d+\.?\d*)% idle/);
+        if (idleMatch) {
+          const total = m.slice(0, 2).reduce((s, x) => s + parseFloat(x), 0);
+          return Math.round((total - parseFloat(idleMatch[1])) * 100) / 100;
+        }
+        return Math.round(m.slice(0, 2).reduce((s, x) => s + parseFloat(x), 0) * 100) / 100;
+      }
+    } catch { /* fall through */ }
+  } else if (process.platform === 'linux') {
+    try {
+      const raw = fs.readFileSync('/proc/stat', 'utf8');
+      const cpuLine = raw.split('\n').find(l => l.startsWith('cpu '));
+      if (!cpuLine) return null;
+      const vals = cpuLine.split(/\s+/).slice(1).map(Number);
+      const total = vals.reduce((a, b) => a + b, 0);
+      const idle = vals[3] || 0;
+      return total > 0 ? Math.round(((total - idle) / total) * 10000) / 100 : null;
+    } catch { /* fall through */ }
   }
+  return null;
 }
 
 function getMemUsage() {
   try {
     const total = os.totalmem();
     const free = os.freemem();
-    const used = total - free;
-    return Math.round((used / 1024 / 1024) * 100) / 100; // MB
-  } catch {
-    return 0;
-  }
+    return Math.round(((total - free) / 1024 / 1024) * 100) / 100; // MB
+  } catch { return 0; }
 }
 
-function getUptimeSeconds() {
-  return os.uptime();
-}
+function getUptimeSeconds() { return os.uptime(); }
 
 function getDiskUsage() {
   try {
-    const out = execSync('df -h / | tail -1', { timeout: 5000 }).toString().trim();
+    // df -k gives 512-byte blocks (Linux/macOS compatible)
+    const out = execSync('df -k / | tail -1', { timeout: 5000, encoding: 'utf8', maxBuffer: 4096 }).trim();
     const cols = out.split(/\s+/);
-    // macOS cols: Filesystem  Size  Used  Avail  Capacity  iused  ifree  %iused  Mounted
-    // Linux cols (df -h):    Filesystem  Size  Used  Avail  Use%  Mounted
-    // Try macOS capacity column first (5th = index 4), then Linux (5th = index 4)
+    // macOS: Filesystem  Size  Used  Avail  Capacity  iused  ifree  %iused  Mounted
+    // Linux:   Filesystem  Size  Used  Avail  Use%  Mounted
+    // Capacity/Use% is at index 4 on macOS (5th col) and Linux (5th col)
     const capStr = cols[4]?.replace(/%/g, '');
     const cap = parseFloat(capStr);
     if (!isNaN(cap)) return cap;
-    // Fallback: compute from 512-byte blocks (Linux df -k style)
+    // Fallback: compute from 512-byte blocks
     const used = parseInt(cols[2], 10);
     const avail = parseInt(cols[3], 10);
     if (!isNaN(used) && !isNaN(avail)) {
       return Math.round((used / (used + avail)) * 10000) / 100;
     }
     return 0;
-  } catch {
-    return 0;
-  }
+  } catch { return 0; }
 }
 
 function getVersion() {
   try {
-    // Try openclaw version first, then node version
-    const out = execSync('openclaw --version 2>/dev/null || node --version', { timeout: 3000 }).toString().trim();
+    const out = execSync('openclaw --version 2>/dev/null || node --version', { timeout: 3000, encoding: 'utf8', maxBuffer: 4096 }).trim();
     return out.replace(/^v/, '');
-  } catch {
-    return process.version.replace(/^v/, '');
-  }
+  } catch { return process.version.replace(/^v/, ''); }
 }
 
 function getIpAddress() {
   try {
-    const interfaces = os.networkInterfaces();
-    for (const name of Object.keys(interfaces)) {
-      for (const iface of interfaces[name]) {
+    for (const name of Object.keys(os.networkInterfaces())) {
+      for (const iface of os.networkInterfaces()[name]) {
         if (iface.internal || iface.family !== 'IPv4') continue;
         return iface.address;
       }
@@ -201,75 +298,198 @@ function getIpAddress() {
   return null;
 }
 
-function getRegion() {
+/**
+ * Region detection:
+ * - Try ipapi.co (free, no API key needed, ~50ms)
+ * - Fallback: infer from OS timezone (unreliable, indicate uncertainty)
+ */
+async function getRegion() {
+  // Fast path: try to get from cache first
+  const cached = fieldCache.get('region');
+  if (cached) return cached;
+
+  try {
+    // Use ipapi.co for accurate geolocation (falls back to IP-based country)
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch('http://ipapi.co/json/', {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'clawwatch-agent/1.0' },
+    });
+    clearTimeout(timer);
+    if (res.ok) {
+      const data = await res.json();
+      const region = data.timezone || data.region || data.country_code || null;
+      if (region) {
+        fieldCache.set('region', region, 3_600_000); // cache 1 hour
+        return region;
+      }
+    }
+  } catch { /* fall through */ }
+
+  // Fallback: use system timezone (less reliable)
   try {
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    // Map common timezones to region names
-    if (tz.includes('Shanghai') || tz.includes('Beijing') || tz.includes('Chongqing') || tz.includes('Urumqi')) return 'Asia/Shanghai';
-    if (tz.includes('Tokyo') || tz.includes('Osaka')) return 'Asia/Tokyo';
-    if (tz.includes('Seoul')) return 'Asia/Seoul';
-    if (tz.includes('Los_Angeles') || tz.includes('San_Francisco')) return 'America/Los_Angeles';
-    if (tz.includes('New_York')) return 'America/New_York';
-    if (tz.includes('London')) return 'Europe/London';
-    if (tz.includes('Berlin') || tz.includes('Paris') || tz.includes('Amsterdam')) return 'Europe/Berlin';
-    return tz;
-  } catch {
-    return null;
-  }
-}
-
-function getGpuModel() {
-  try {
-    const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep "Chipset Model" | head -1', { timeout: 5000 }).toString().trim();
-    return out.replace(/^.*:\s*/, '').trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-function getVramUsage() {
-  // Apple M4 uses unified memory — VRAM is shared with system RAM.
-  // Try to parse dedicated VRAM on discrete GPUs (Intel/w dGPU), return null for Apple Silicon.
-  try {
-    const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1', { timeout: 5000 }).toString().trim();
-    const mb = out.match(/(\d+)\s*MB/i)?.[1];
-    if (mb) return parseInt(mb, 10);
-    const gb = out.match(/(\d+)\s*GB/i)?.[1];
-    if (gb) return parseInt(gb, 10) * 1024;
+    if (tz) {
+      fieldCache.set('region', tz, 300_000); // cache 5 min only (unreliable)
+      return tz;
+    }
   } catch { /* ignore */ }
-  return null; // null = unified memory (Apple Silicon) or unavailable
-}
-
-function getGpuLoad() {
-  // Apple Silicon (M-series): GPU is integrated; no user-accessible GPU load without root.
-  // powermetrics requires sudo. top -stats gpu produces no output on macOS.
-  // Estimate: Apple Silicon GPU activity is proportional to overall CPU pressure.
-  // Leave as null to indicate "not measured" — cpu_load is the best proxy.
   return null;
 }
 
-function getActiveModel() {
-  // Try to read the active model from OpenClaw environment / runtime state
-  // Check common env vars that might carry model info
-  const model = process.env.OC_MODEL
-    || process.env.ACTIVE_MODEL
-    || process.env.OPENCLAW_MODEL
-    || null;
-  return model;
+function getGpuModel() {
+  if (process.platform === 'darwin') {
+    try {
+      const out = execSync(
+        'system_profiler SPDisplaysDataType 2>/dev/null | grep "Chipset Model" | head -1',
+        { timeout: 5000, encoding: 'utf8', maxBuffer: 4096 }
+      ).trim().replace(/^.*:\s*/, '').trim();
+      return out || null;
+    } catch { /* ignore */ }
+  }
+  return null;
 }
 
-// 从 session transcript 解析今日 token 使用量
+function getVramUsage() {
+  if (process.platform === 'darwin') {
+    try {
+      const out = execSync(
+        'system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1',
+        { timeout: 5000, encoding: 'utf8', maxBuffer: 4096 }
+      ).trim();
+      const mb = out.match(/(\d+)\s*MB/i)?.[1];
+      if (mb) return parseInt(mb, 10);
+      const gb = out.match(/(\d+)\s*GB/i)?.[1];
+      if (gb) return parseInt(gb, 10) * 1024;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+function getGpuLoad() { return null; } // Requires elevated privileges; leave null
+
+// ─── OpenClaw local file readers (no exec) ───────────────────────────────────
+
+/** Read current active model from openclaw.json config. */
+function getActiveModel() {
+  const cached = fieldCache.get('active_model');
+  if (cached !== null) return cached;
+
+  try {
+    const cfgPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    const model = cfg.defaults?.model || cfg.models?.default || null;
+    fieldCache.set('active_model', model, 60_000);
+    return model;
+  } catch { return null; }
+}
+
+/**
+ * Get agents summary by reading local agent directories.
+ * Replaces: execSync('openclaw agents list --json')
+ *
+ * Fields per agent:
+ * - name: directory name
+ * - status: inferred from session mtime (active < 5min = running, 5-60min = idle, > 60min = offline)
+ * - lastActiveAt: ISO timestamp from most recent session file mtime
+ * - sessions: count from sessions.json
+ */
+function getAgentsSummary() {
+  const cached = fieldCache.get('agents_summary');
+  if (cached !== null) return cached;
+
+  const agentsDir = path.join(os.homedir(), '.openclaw', 'agents');
+  if (!fs.existsSync(agentsDir)) {
+    fieldCache.set('agents_summary', [], 60_000);
+    return [];
+  }
+
+  let agentEntries;
+  try {
+    agentEntries = fs.readdirSync(agentsDir);
+  } catch {
+    fieldCache.set('agents_summary', [], 60_000);
+    return [];
+  }
+
+  const now = Date.now();
+  const FIVE_MIN = 5 * 60_000;
+  const SIXTY_MIN = 60 * 60_000;
+
+  const agents = [];
+  for (const agentId of agentEntries) {
+    if (agentId.startsWith('.')) continue;
+    const agentDir = path.join(agentsDir, agentId);
+    const sessionsDir = path.join(agentDir, 'sessions');
+
+    let sessionCount = 0;
+    let lastSessionMtime = 0;
+
+    if (fs.existsSync(sessionsDir)) {
+      // Count sessions from sessions.json
+      const sp = path.join(sessionsDir, 'sessions.json');
+      try {
+        const obj = JSON.parse(fs.readFileSync(sp, 'utf8'));
+        sessionCount = Object.keys(obj).length;
+      } catch { /* ignore */ }
+
+      // Find most recent session file mtime
+      try {
+        const files = fs.readdirSync(sessionsDir);
+        for (const f of files) {
+          if (!f.endsWith('.jsonl') || f.includes('.checkpoint') || f.includes('.deleted')) continue;
+          const stat = fs.statSync(path.join(sessionsDir, f));
+          if (stat.mtimeMs > lastSessionMtime) lastSessionMtime = stat.mtimeMs;
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Infer status from last session activity
+    let status = 'offline';
+    if (lastSessionMtime > 0) {
+      const age = now - lastSessionMtime;
+      if (age < FIVE_MIN) status = 'running';
+      else if (age < SIXTY_MIN) status = 'idle';
+    }
+
+    // Format lastActiveAt as ISO8601 UTC
+    const lastActiveAt = lastSessionMtime > 0
+      ? new Date(lastSessionMtime).toISOString()
+      : null;
+
+    agents.push({
+      name: agentId,
+      status,
+      lastActiveAt,
+      sessions: sessionCount > 0 ? sessionCount : (lastSessionMtime > 0 ? 1 : 0),
+      storePathSummary: null,
+      workState: null,
+      bootstrapMissing: null,
+    });
+  }
+
+  fieldCache.set('agents_summary', agents, 60_000);
+  return agents;
+}
+
+// ─── Token stats from session jsonl (no exec) ─────────────────────────────────
+
+/**
+ * Parse today's token usage from session transcript jsonl files.
+ * Tracks: input_tokens, output_tokens, api_calls, error_count, active_session_count
+ */
 function getTodayTokenStats() {
   const now = Date.now();
   const msPerDay = 86_400_000;
+  // Today in UTC+8
   const utc8OffsetMs = 8 * 3_600_000;
   const todayStartMs = Math.floor((now - utc8OffsetMs) / msPerDay) * msPerDay + utc8OffsetMs;
 
   let freshInput = 0, freshOutput = 0, apiCalls = 0, errorCount = 0;
-  // 修复：使用 Set 统计今日有活动的独立 session 数
   const todayActiveSessionIds = new Set();
 
-  const agentsDir = path.join(process.env.HOME || '', '.openclaw', 'agents');
+  const agentsDir = path.join(os.homedir(), '.openclaw', 'agents');
   if (!fs.existsSync(agentsDir)) {
     return { todayTokens: 0, inputTokens: 0, outputTokens: 0, apiCalls: 0, errorCount: 0, activeSessionCount: 0 };
   }
@@ -277,35 +497,36 @@ function getTodayTokenStats() {
   try {
     const agentIds = fs.readdirSync(agentsDir);
     for (const agentId of agentIds) {
+      if (agentId.startsWith('.')) continue;
       const sessionsDir = path.join(agentsDir, agentId, 'sessions');
       if (!fs.existsSync(sessionsDir)) continue;
 
       const files = fs.readdirSync(sessionsDir).filter(f =>
-        f.endsWith('.jsonl') && !f.includes('.checkpoint.') && !f.includes('.deleted.') && !f.includes('.reset.')
+        f.endsWith('.jsonl') && !f.includes('.checkpoint') && !f.includes('.deleted') && !f.includes('.reset')
       );
 
       for (const file of files) {
         const fp = path.join(sessionsDir, file);
         try {
           const stat = fs.statSync(fp);
+          // Skip files with no recent modifications
           if (stat.mtimeMs < todayStartMs) continue;
 
           const content = fs.readFileSync(fp, 'utf8');
-          const lines = content.split('\n').filter(l => l.trim() && l !== '[' && l !== ']');
+          const lines = content.split('\n');
 
           for (const line of lines) {
+            if (!line.trim()) continue;
             try {
-              const obj = JSON.parse(line.replace(/,$/, '').trim());
+              const obj = JSON.parse(line);
               if (obj?.type === 'error') { errorCount++; continue; }
-              // 收集 sessionId 用于统计真正的活跃会话数
               if (obj?.sessionId) todayActiveSessionIds.add(obj.sessionId);
               if (obj?.message?.usage) {
-                const u = obj.message.usage;
-                freshInput += u.input || 0;
-                freshOutput += u.output || 0;
+                freshInput += obj.message.usage.input || 0;
+                freshOutput += obj.message.usage.output || 0;
                 apiCalls++;
               }
-            } catch { /* skip malformed lines */ }
+            } catch { /* skip malformed JSON lines */ }
           }
         } catch { /* skip unreadable files */ }
       }
@@ -318,300 +539,98 @@ function getTodayTokenStats() {
     outputTokens: freshOutput,
     apiCalls,
     errorCount,
-    activeSessionCount: todayActiveSessionIds.size
+    activeSessionCount: todayActiveSessionIds.size,
   };
 }
 
-// 获取会话数
+/** Get total session count across all agents. */
 function getSessionsCount() {
-  const agentsDir = path.join(process.env.HOME || '', '.openclaw', 'agents');
+  const agentsDir = path.join(os.homedir(), '.openclaw', 'agents');
   if (!fs.existsSync(agentsDir)) return 0;
 
   let total = 0;
   try {
-    const agentIds = fs.readdirSync(agentsDir);
-    for (const agentId of agentIds) {
+    for (const agentId of fs.readdirSync(agentsDir)) {
+      if (agentId.startsWith('.')) continue;
       const sp = path.join(agentsDir, agentId, 'sessions', 'sessions.json');
       if (fs.existsSync(sp)) {
-        const obj = JSON.parse(fs.readFileSync(sp, 'utf8'));
-        total += Object.keys(obj).length;
+        try {
+          const obj = JSON.parse(fs.readFileSync(sp, 'utf8'));
+          total += Object.keys(obj).length;
+        } catch { /* ignore */ }
       }
     }
   } catch { /* ignore */ }
   return total;
 }
 
-function truncateAgentField(v, max) {
-  if (v == null) return undefined;
-  const s = String(v).trim();
-  if (!s) return undefined;
-  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+// ─── Payload building ─────────────────────────────────────────────────────────
+
+function buildPayloadFromEnv(node_id) {
+  const version = getVersion();
+  const diskUsage = getDiskUsage();
+  const ipAddress = getIpAddress();
+  const gpuModel = getGpuModel();
+  const uptimeSec = getUptimeSeconds();
+
+  const tokenStats = getTodayTokenStats();
+
+  return {
+    node_id,
+    version,
+    disk_usage: diskUsage,
+    ip_address: ipAddress,
+    region: null, // filled async below
+    gpu_model: gpuModel,
+    gpu_load: getCpuLoad(),
+    vram_usage: getVramUsage(),
+    active_model: getActiveModel(),
+    agents_summary: getAgentsSummary(),
+    today_tokens: tokenStats.todayTokens,
+    input_tokens: tokenStats.inputTokens,
+    output_tokens: tokenStats.outputTokens,
+    requests_processed: tokenStats.apiCalls,
+    requests_failed: tokenStats.errorCount,
+    tokens_per_second: uptimeSec > 0 ? Math.round((tokenStats.todayTokens / uptimeSec) * 100) / 100 : 0,
+    sessions: getSessionsCount(),
+    active_sessions: tokenStats.activeSessionCount,
+    // context_percent / cache_hit_rate: unavailable without exec; omit (server keeps last value)
+  };
 }
 
 /**
- * 从 `openclaw status --json` 解析 sessions 块，提取 Context 使用率和 Cache 命中率等全局统计。
+ * Local diff: deep-compare two payloads.
+ * Returns true if any value changed (strict equality).
  */
-function getOpenClawStatusStats() {
-  try {
-    const out = execSync('openclaw status --json 2>/dev/null', {
-      encoding: 'utf8',
-      timeout: 2500,
-      maxBuffer: 512 * 1024,
-    }).trim();
-    if (!out || out[0] !== '{') return {};
-    const j = JSON.parse(out);
-
-    const byAgent = j.sessions?.byAgent;
-    if (!Array.isArray(byAgent) || byAgent.length === 0) return {};
-
-    // 收集所有 recent session 的数据
-    let totalPercentUsed = 0;
-    let totalCacheRead = 0;
-    let totalCacheWrite = 0;
-    let totalInputTokens = 0;
-    let totalOutputTokens = 0;
-    let sessionCount = 0;
-    let cacheSessionCount = 0;
-    let cacheHitRateSum = 0;
-    let contextLimit = null;
-    const contextLimits = {};
-
-    for (const agent of byAgent) {
-      const recent = agent.recent;
-      if (!Array.isArray(recent)) continue;
-      for (const s of recent) {
-        // percentUsed: 最近一次 context 使用百分比
-        if (typeof s.percentUsed === 'number' && s.percentUsed > 0) {
-          totalPercentUsed += s.percentUsed;
-          sessionCount++;
-        }
-        // cache: 缓存读取量和写入量（绝对值），命中率取各 session 命中率均值
-        if (typeof s.cacheRead === 'number' && typeof s.totalTokens === 'number' && s.totalTokens > 0) {
-          totalCacheRead += s.cacheRead;
-          totalCacheWrite += s.cacheWrite || 0;
-          // 单 session 命中率 = cacheRead / (cacheRead + newTokens)，避免跨 session 累加失真
-          const newTokens = Math.max(0, s.totalTokens - (s.cacheRead > s.totalTokens ? s.totalTokens : s.cacheRead));
-          const sessionHitRate = s.totalTokens > 0 ? Math.round((s.cacheRead / s.totalTokens) * 100) : 0;
-          cacheHitRateSum += sessionHitRate;
-          cacheSessionCount++;
-        }
-        // input/output tokens from recent session (most authoritative)
-        if (typeof s.inputTokens === 'number') totalInputTokens += s.inputTokens;
-        if (typeof s.outputTokens === 'number') totalOutputTokens += s.outputTokens;
-        // context limit: most common value across agents
-        if (typeof s.contextTokens === 'number' && s.contextTokens > 0) {
-          contextLimits[s.contextTokens] = (contextLimits[s.contextTokens] || 0) + 1;
-        }
-      }
+function payloadsEqual(a, b) {
+  if (!a || !b) return a === b;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) {
+    const va = a[k];
+    const vb = b[k];
+    if (va === vb) continue;
+    // Deep compare for objects/arrays
+    if (typeof va === 'object' && typeof vb === 'object') {
+      if (JSON.stringify(va) !== JSON.stringify(vb)) return false;
+    } else {
+      return false;
     }
-
-    // 取出现次数最多的 contextLimit
-    if (Object.keys(contextLimits).length > 0) {
-      contextLimit = parseInt(
-        Object.entries(contextLimits).sort((a, b) => b[1] - a[1])[0][0],
-        10
-      );
-    }
-
-    const avgPercentUsed = sessionCount > 0 ? Math.round(totalPercentUsed / sessionCount) : null;
-    const avgCacheHitRate = cacheSessionCount > 0 ? Math.round(cacheHitRateSum / cacheSessionCount) : null;
-
-    return {
-      context_percent: avgPercentUsed,
-      context_limit: contextLimit,
-      cache_hit_rate: avgCacheHitRate,
-      // 从 status JSON 的 sessions 提取 input/output tokens
-      // 覆盖 jsonl 解析的粗略值（更准确，因为是实时状态）
-      _inputTokensFromStatus: totalInputTokens,
-      _outputTokensFromStatus: totalOutputTokens,
-      // 缓存绝对值（字节），供 iOS 展示 "Xk cached, Xk new"
-      _cacheRead: totalCacheRead,
-      _cacheWrite: totalCacheWrite,
-    };
-  } catch {
-    return {};
   }
+  return true;
 }
 
-/** 与 docs/ARCHITECTURE §9.1 对齐的轻量摘要；控制条数与字段长度以便 Worker 截断前尽量小。 */
-function getAgentsSummary() {
-  try {
-    const out = execSync('openclaw agents list --json 2>/dev/null | head -c 12000 || echo ""', { timeout: 3000 }).toString().trim();
-    if (!out || out === '[]' || out === '' || out.toLowerCase().includes('error')) return null;
-    let parsed;
-    try {
-      parsed = JSON.parse(out);
-    } catch {
-      return null;
-    }
-    if (!Array.isArray(parsed)) return null;
-    const rows = parsed.slice(0, 16).map((a) => {
-      const sessions =
-        typeof a.sessions === 'number'
-          ? a.sessions
-          : typeof a.sessionCount === 'number'
-            ? a.sessionCount
-            : undefined;
-      const lastActive =
-        a.last_active_at ||
-        a.lastActiveAt ||
-        a.updatedAt ||
-        a.lastSeen ||
-        a.lastActivity;
-      const storeRaw = a.store_path_summary || a.storePathSummary || a.storePath || a.store || a.path;
-      let bootstrapMissing;
-      if (typeof a.bootstrap_missing === 'boolean') bootstrapMissing = a.bootstrap_missing;
-      else if (typeof a.bootstrapMissing === 'boolean') bootstrapMissing = a.bootstrapMissing;
-      else if (typeof a.bootstrap === 'boolean') bootstrapMissing = !a.bootstrap;
-      const workState = a.work_state || a.workState || a.state;
-      const status =
-        typeof a.status === 'string' && a.status.trim()
-          ? a.status.trim()
-          : a.running === true
-            ? 'running'
-            : a.running === false
-              ? 'idle'
-              : undefined;
-      return {
-        id: a.id || a.agentId || undefined,
-        name: a.name || a.displayName || a.id || a.agentId,
-        status,
-        sessions,
-        last_active_at: lastActive != null ? String(lastActive).slice(0, 200) : undefined,
-        store_path_summary: truncateAgentField(storeRaw, 160),
-        bootstrap_missing: bootstrapMissing,
-        work_state: workState != null ? String(workState).slice(0, 120) : undefined,
-      };
-    });
-    return JSON.stringify(rows);
-  } catch {
-    return null;
-  }
-}
-
-/** 解析 `openclaw status --json`（若存在）填充 task_* / need_approval；失败则返回空对象。 */
-function tryOpenClawStatusFields() {
-  try {
-    const out = execSync('openclaw status --json 2>/dev/null', {
-      encoding: 'utf8',
-      timeout: 2500,
-      maxBuffer: 512 * 1024,
-    }).trim();
-    if (!out || out[0] !== '{') return {};
-    const j = JSON.parse(out);
-    const r = {};
-    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
-
-    const na = num(j.need_approval ?? j.needApproval ?? j.pending_approvals);
-    if (na != null) r.need_approval = na;
-
-    const ts = j.task_status ?? j.taskStatus;
-    if (typeof ts === 'string' && ts.trim()) r.task_status = ts.trim().slice(0, 120);
-
-    const td = j.task_desc ?? j.taskDesc ?? j.task ?? j.summary?.line ?? j.active_task;
-    if (typeof td === 'string' && td.trim()) r.task_desc = td.trim().slice(0, 500);
-
-    const sp = j.step_progress ?? j.stepProgress;
-    if (typeof sp === 'string' && sp.trim()) r.step_progress = sp.trim().slice(0, 120);
-
-    const qd = num(j.queue_depth ?? j.queueDepth ?? j.queue?.depth);
-    if (qd != null) {
-      if (!r.task_status) r.task_status = 'queue';
-      if (!r.task_desc) r.task_desc = `depth ${qd}`;
-    }
-    return r;
-  } catch {
-    return {};
-  }
-}
-
-/** Worker `GET /api/v1/config` 往返时延（ms），用于填充 `api_latency`；失败返回 null。 */
-async function measureWorkerLatencyMs(baseUrl) {
-  const root = String(baseUrl || '').replace(/\/$/, '');
-  if (!root) return null;
-  const url = `${root}/api/v1/config`;
-  const t0 = Date.now();
-  try {
-    const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
-    await res.text();
-    if (!res.ok) return null;
-    return Math.max(0, Math.round(Date.now() - t0));
-  } catch {
-    return null;
-  }
-}
-
-function buildPayloadFromEnv(node_id) {
-  let extra = {};
-  const raw = process.env.CLAWWATCH_PAYLOAD_JSON;
-  if (raw) {
-    try {
-      extra = JSON.parse(raw);
-      if (typeof extra !== 'object' || extra === null || Array.isArray(extra)) {
-        throw new Error('CLAWWATCH_PAYLOAD_JSON must be a JSON object');
-      }
-    } catch (e) {
-      throw new Error(String(e.message || e));
-    }
-  } else {
-    const cpuLoad = getCpuLoad();
-    const memUsage = getMemUsage();
-    const uptimeSec = Math.round(getUptimeSeconds());
-    const diskUsage = getDiskUsage();
-    const version = getVersion();
-    const ipAddress = getIpAddress();
-    const region = getRegion();
-    const gpuModel = getGpuModel();
-
-    // 从 openclaw status --json 解析 sessions 块（更准确的实时数据）
-    const statusStats = getOpenClawStatusStats();
-    const tokenStats = getTodayTokenStats();
-
-    extra = {
-      node_name: os.hostname(),
-      status: 'online',
-      cpu_load: cpuLoad,
-      mem_usage: memUsage,
-      uptime_seconds: uptimeSec,
-      version,
-      disk_usage: diskUsage,
-      ip_address: ipAddress,
-      region,
-      gpu_model: gpuModel,
-      gpu_load: getGpuLoad(),
-      vram_usage: getVramUsage(),
-      active_model: getActiveModel(),
-      agents_summary: getAgentsSummary(),
-      // Token stats：优先用 status JSON 的实时数据，fallback 到 jsonl 解析
-      today_tokens: (statusStats._inputTokensFromStatus + statusStats._outputTokensFromStatus) || tokenStats.todayTokens,
-      input_tokens: statusStats._inputTokensFromStatus || tokenStats.inputTokens,
-      output_tokens: statusStats._outputTokensFromStatus || tokenStats.outputTokens,
-      requests_processed: tokenStats.apiCalls,
-      requests_failed: tokenStats.errorCount,
-      tokens_per_second: uptimeSec > 0 ? Math.round((tokenStats.todayTokens / uptimeSec) * 100) / 100 : 0,
-      sessions: getSessionsCount(),
-      active_sessions: tokenStats.activeSessionCount,
-      // 新增：Context 使用率和 Cache 命中率
-      context_percent: statusStats.context_percent ?? null,
-      context_limit: statusStats.context_limit ?? null,
-      cache_hit_rate: statusStats.cache_hit_rate ?? null,
-      // 缓存绝对值（字节），供 iOS 展示 "Xk cached, Xk new"
-      cache_read: statusStats._cacheRead ?? null,
-      cache_write: statusStats._cacheWrite ?? null,
-    };
-  }
-  return { node_id, ...extra };
-}
+// ─── Main run loop ────────────────────────────────────────────────────────────
 
 async function cmdRun(baseUrl, statePath) {
   const st = loadState(statePath);
-  const node_id = st.node_id;
-  const node_secret = st.node_secret;
+  const { node_id, node_secret } = st;
   if (!node_id || !node_secret) throw new Error('Invalid state file; run setup first');
 
-  let lastHash = null;
-  let lastSentAt = 0;
-  const dedupeWindowMs = 60_000;
+  // Restore last payload and region cache from disk
+  loadLastPayload();
+
+  let consecutiveErrors = 0;
+  const MAX_ERRORS_BEFORE_LONG_WAIT = 5;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -620,42 +639,57 @@ async function cmdRun(baseUrl, statePath) {
       policy = await postPolicy(baseUrl, node_id, node_secret);
     } catch (e) {
       console.error('[clawwatch-agent] report_policy failed:', e.message || e);
-      await sleep(30_000);
+      consecutiveErrors++;
+      await sleep(consecutiveErrors >= MAX_ERRORS_BEFORE_LONG_WAIT ? 300_000 : 30_000);
       continue;
     }
 
+    consecutiveErrors = 0; // reset on successful policy fetch
     const intervalSec = Math.max(5, Number(policy.next_interval_sec) || 180);
+
     if (!policy.report_allowed) {
       await sleep(intervalSec * 1000);
       continue;
     }
 
-    // Build base payload with system metrics + Worker RTT + OpenClaw status（若 CLI 可用）
-    const basePayload = buildPayloadFromEnv(node_id);
-    const latMs = await measureWorkerLatencyMs(baseUrl);
-    if (latMs != null) basePayload.api_latency = latMs;
-    Object.assign(basePayload, tryOpenClawStatusFields());
-    const body = JSON.stringify(basePayload);
-    const hash = sha256Hex(body);
-    const now = Date.now();
-    if (hash === lastHash && now - lastSentAt < dedupeWindowMs) {
-      await sleep(intervalSec * 1000);
+    // Build payload
+    const payload = buildPayloadFromEnv(node_id);
+
+    // Fill region asynchronously (has its own cache)
+    const region = await getRegion();
+    payload.region = region;
+
+    // Worker RTT
+    let latMs;
+    try {
+      const t0 = Date.now();
+      await fetch(`${baseUrl}/api/v1/health`);
+      latMs = Date.now() - t0;
+    } catch { /* ignore */ }
+    if (latMs != null) payload.api_latency = latMs;
+
+    // Local diff: skip if nothing changed
+    if (lastPayload !== null && payloadsEqual(payload, lastPayload)) {
+      // Nothing changed; skip reporting but respect server's next_interval
+      const next = policy.next_interval_sec;
+      await sleep((typeof next === 'number' && next > 0 ? next : intervalSec) * 1000);
       continue;
     }
 
     try {
-      const rep = await postReport(baseUrl, node_id, node_secret, basePayload);
-      lastHash = hash;
-      lastSentAt = Date.now();
+      const rep = await postReport(baseUrl, node_id, node_secret, payload);
+      lastPayload = payload;
+      saveLastPayload(payload);
+      consecutiveErrors = 0;
+
       const next = rep?.next_interval_sec;
-      if (typeof next === 'number' && next > 0) {
-        await sleep(next * 1000);
-      } else {
-        await sleep(intervalSec * 1000);
-      }
+      await sleep((typeof next === 'number' && next > 0 ? next : intervalSec) * 1000);
     } catch (e) {
+      consecutiveErrors++;
       console.error('[clawwatch-agent] report failed:', e.message || e);
-      await sleep(intervalSec * 1000);
+      // Exponential back-off on errors, capped at 5 minutes
+      const backoffMs = Math.min(300_000, intervalSec * 1000 * Math.pow(1.5, consecutiveErrors - 1));
+      await sleep(backoffMs);
     }
   }
 }
@@ -670,6 +704,7 @@ async function main() {
     console.error('Missing --base <worker URL> or CLAWWATCH_BASE_URL');
     process.exit(1);
   }
+
   const statePath = defaultStatePath();
   if (cmd === 'setup') {
     await cmdSetup(base, statePath);
@@ -677,10 +712,7 @@ async function main() {
   }
   if (cmd === 'bind') {
     const tok = positional[0];
-    if (!tok) {
-      console.error('Missing link_token argument');
-      process.exit(1);
-    }
+    if (!tok) { console.error('Missing link_token argument'); process.exit(1); }
     await cmdBind(base, statePath, tok);
     return;
   }
@@ -692,7 +724,7 @@ async function main() {
   process.exit(1);
 }
 
-main().catch((e) => {
+main().catch(e => {
   console.error(e);
   process.exit(1);
 });
