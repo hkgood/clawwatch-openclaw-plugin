@@ -249,13 +249,30 @@ function getGpuLoad() {
 }
 
 function getActiveModel() {
-  // Try to read the active model from OpenClaw environment / runtime state
-  // Check common env vars that might carry model info
-  const model = process.env.OC_MODEL
-    || process.env.ACTIVE_MODEL
-    || process.env.OPENCLAW_MODEL
-    || null;
-  return model;
+  // Read active model from sessions.json - most recently active session's authProfileOverride
+  // Format: "provider:model" e.g. "minimax-portal:default"
+  const agentsDir = path.join(process.env.HOME || '.', '.openclaw', 'agents');
+  if (!fs.existsSync(agentsDir)) return null;
+  try {
+    for (const agentId of fs.readdirSync(agentsDir)) {
+      const sp = path.join(agentsDir, agentId, 'sessions', 'sessions.json');
+      if (!fs.existsSync(sp)) continue;
+      const sessions = JSON.parse(fs.readFileSync(sp, 'utf8'));
+      const entries = Object.values(sessions);
+      if (!entries.length) continue;
+      // Find most recently updated session
+      let latest = entries[0];
+      for (const e of entries) {
+        if ((e.updatedAt || 0) > (latest.updatedAt || 0)) latest = e;
+      }
+      const override = latest.authProfileOverride || latest.authProfile;
+      if (override) {
+        // Strip provider prefix, return just the model name
+        return override.includes(':') ? override.split(':')[1] : override;
+      }
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 // 从 session transcript 解析今日 token 使用量
@@ -489,40 +506,29 @@ function getAgentsSummary() {
   }
 }
 
-/** 解析 `openclaw status --json`（若存在）填充 task_* / need_approval；失败则返回空对象。 */
-function tryOpenClawStatusFields() {
+/** Read task status from edict kanban live_status.json (no exec required). */
+function getKanbanStatus() {
+  const r = {};
+  const fp = path.join(process.env.HOME || '.', 'edict', 'data', 'live_status.json');
+  if (!fs.existsSync(fp)) return r;
   try {
-    const out = execSync('openclaw status --json 2>/dev/null', {
-      encoding: 'utf8',
-      timeout: 2500,
-      maxBuffer: 512 * 1024,
-    }).trim();
-    if (!out || out[0] !== '{') return {};
-    const j = JSON.parse(out);
-    const r = {};
-    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
-
-    const na = num(j.need_approval ?? j.needApproval ?? j.pending_approvals);
-    if (na != null) r.need_approval = na;
-
-    const ts = j.task_status ?? j.taskStatus;
-    if (typeof ts === 'string' && ts.trim()) r.task_status = ts.trim().slice(0, 120);
-
-    const td = j.task_desc ?? j.taskDesc ?? j.task ?? j.summary?.line ?? j.active_task;
-    if (typeof td === 'string' && td.trim()) r.task_desc = td.trim().slice(0, 500);
-
-    const sp = j.step_progress ?? j.stepProgress;
-    if (typeof sp === 'string' && sp.trim()) r.step_progress = sp.trim().slice(0, 120);
-
-    const qd = num(j.queue_depth ?? j.queueDepth ?? j.queue?.depth);
-    if (qd != null) {
-      if (!r.task_status) r.task_status = 'queue';
-      if (!r.task_desc) r.task_desc = `depth ${qd}`;
-    }
-    return r;
-  } catch {
-    return {};
-  }
+    const d = JSON.parse(fs.readFileSync(fp, 'utf8'));
+    const m = d.metrics || {};
+    if (m.blocked > 0) { r.task_status = 'blocked'; }
+    else if (m.inProgress > 0) { r.task_status = 'in_progress'; }
+    else if (m.todayDone > 0) { r.task_status = 'done'; }
+    else { r.task_status = 'idle'; }
+    r.need_approval = 0;
+    if (m.blocked > 0) r.task_desc = `${m.blocked} blocked, ${m.inProgress} in progress`;
+    else if (m.inProgress > 0) r.task_desc = `${m.inProgress} in progress, ${m.todayDone || 0} done today`;
+    else if (m.todayDone > 0) r.task_desc = `${m.todayDone} done today`;
+    else r.task_desc = 'all clear';
+    // Step progress: "X done, Y in progress, Z blocked"
+    const total = (m.totalDone || 0) + (m.inProgress || 0) + (m.blocked || 0);
+    if (total > 0) r.step_progress = `${m.todayDone || 0}/${total}`;
+    else r.step_progress = '0/0';
+  } catch { /* ignore */ }
+  return r;
 }
 
 /** Worker `GET /api/v1/config` 往返时延（ms），用于填充 `api_latency`；失败返回 null。 */
@@ -563,8 +569,9 @@ function buildPayloadFromEnv(node_id) {
     const region = getRegion();
     const gpuModel = getGpuModel();
 
-    // 从 openclaw status --json 解析 sessions 块（更准确的实时数据）
-    const statusStats = getOpenClawStatusStats();
+    // Token stats from edict kanban live_status (task metrics, not model usage)
+    const kanbanStatus = getKanbanStatus();
+
     const tokenStats = getTodayTokenStats();
 
     extra = {
@@ -582,22 +589,20 @@ function buildPayloadFromEnv(node_id) {
       vram_usage: getVramUsage(),
       active_model: getActiveModel(),
       agents_summary: getAgentsSummary(),
-      // Token stats：优先用 status JSON 的实时数据，fallback 到 jsonl 解析
-      today_tokens: (statusStats._inputTokensFromStatus + statusStats._outputTokensFromStatus) || tokenStats.todayTokens,
-      input_tokens: statusStats._inputTokensFromStatus || tokenStats.inputTokens,
-      output_tokens: statusStats._outputTokensFromStatus || tokenStats.outputTokens,
+      // Token stats from jsonl session transcripts
+      today_tokens: tokenStats.todayTokens,
+      input_tokens: tokenStats.inputTokens,
+      output_tokens: tokenStats.outputTokens,
       requests_processed: tokenStats.apiCalls,
       requests_failed: tokenStats.errorCount,
       tokens_per_second: uptimeSec > 0 ? Math.round((tokenStats.todayTokens / uptimeSec) * 100) / 100 : 0,
       sessions: getSessionsCount(),
       active_sessions: tokenStats.activeSessionCount,
-      // 新增：Context 使用率和 Cache 命中率
-      context_percent: statusStats.context_percent ?? null,
-      context_limit: statusStats.context_limit ?? null,
-      cache_hit_rate: statusStats.cache_hit_rate ?? null,
-      // 缓存绝对值（字节），供 iOS 展示 "Xk cached, Xk new"
-      cache_read: statusStats._cacheRead ?? null,
-      cache_write: statusStats._cacheWrite ?? null,
+      // Task status from edict kanban
+      task_status: kanbanStatus.task_status ?? null,
+      task_desc: kanbanStatus.task_desc ?? null,
+      step_progress: kanbanStatus.step_progress ?? null,
+      need_approval: kanbanStatus.need_approval ?? null,
     };
   }
   return { node_id, ...extra };
@@ -630,11 +635,10 @@ async function cmdRun(baseUrl, statePath) {
       continue;
     }
 
-    // Build base payload with system metrics + Worker RTT + OpenClaw status（若 CLI 可用）
+    // Build base payload with system metrics + Worker RTT + OpenClaw status
     const basePayload = buildPayloadFromEnv(node_id);
     const latMs = await measureWorkerLatencyMs(baseUrl);
     if (latMs != null) basePayload.api_latency = latMs;
-    Object.assign(basePayload, tryOpenClawStatusFields());
     const body = JSON.stringify(basePayload);
     const hash = sha256Hex(body);
     const now = Date.now();
