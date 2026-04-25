@@ -9,6 +9,58 @@ import path from 'path';
 import os from 'os';
 import { execSync } from 'child_process';
 
+// ─── Task 1: i18n ────────────────────────────────────────────────────────────
+
+const I18N = {
+  en: {
+    nodeOnline:       'Node online',
+    nodeOffline:      'Node offline',
+    nodeDown:         'Node down (missing)',
+    reportFailed:     'report failed',
+    policyFailed:     'report_policy failed',
+    planFree:         'Plan: Free',
+    nodesUsed:        'Nodes:',
+    upgradeUrl:       'Upgrade:',
+    upgradeTip:        'Upgrade: https://cw.osglab.win/settings?plan=pro',
+    pendingReports:   'Received SIGTERM, waiting for pending reports',
+    exiting:          'Exiting cleanly.',
+  },
+  zh: {
+    nodeOnline:       '节点在线',
+    nodeOffline:      '节点离线',
+    nodeDown:         '节点失联',
+    reportFailed:     '上报失败',
+    policyFailed:     '策略获取失败',
+    planFree:         '订阅计划：免费版',
+    nodesUsed:        '节点数：',
+    upgradeUrl:       '升级：',
+    upgradeTip:       '升级：https://cw.osglab.win/settings?plan=pro',
+    pendingReports:   '收到 SIGTERM，正在等待上报完成…',
+    exiting:          '正在退出。',
+  },
+};
+
+const LANG = (process.env.OPENCLAW_LANG || Intl.DateTimeFormat().resolvedOptions().locale || 'en')
+  .toLowerCase()
+  .startsWith('zh') ? 'zh' : 'en';
+
+const t = (key) => I18N[LANG][key] ?? I18N['en'][key] ?? key;
+
+// ─── Task 3: graceful shutdown ─────────────────────────────────────────────
+
+let pendingReports = 0;
+
+const gracefulExit = async () => {
+  console.log(`[ClawWatch] ${t('pendingReports')}`);
+  while (pendingReports > 0) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  console.log(`[ClawWatch] ${t('exiting')}`);
+  process.exit(0);
+};
+process.on('SIGTERM', gracefulExit);
+process.on('SIGINT', gracefulExit);
+
 const defaultStatePath = () =>
   process.env.CLAWWATCH_STATE || path.join(process.env.HOME || '.', '.clawwatch', 'agent.json');
 
@@ -109,13 +161,26 @@ async function postPolicy(baseUrl, node_id, node_secret) {
 }
 
 async function postReport(baseUrl, node_id, node_secret, payload) {
-  const body = JSON.stringify(payload);
-  const sig = hmacHex(node_secret, body);
-  return fetchJson(`${baseUrl}/api/v1/agent/report`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-signature': sig },
-    body,
-  });
+  pendingReports++;
+  try {
+    const body = JSON.stringify(payload);
+    const sig = hmacHex(node_secret, body);
+    const res = await fetchJson(`${baseUrl}/api/v1/agent/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-signature': sig },
+      body,
+    });
+
+    // ── Task 4: plan / node-limit awareness ────────────────────────────────
+    if (res && res.plan === 'free' && typeof res.max_nodes === 'number') {
+      const used = typeof res.nodes_used === 'number' ? res.nodes_used : '?';
+      console.log(`[ClawWatch] ${t('planFree')} | ${t('nodesUsed')} ${used}/${res.max_nodes} | ${t('upgradeTip')}`);
+    }
+
+    return res;
+  } finally {
+    pendingReports--;
+  }
 }
 
 function sleep(ms) {
@@ -649,7 +714,7 @@ async function cmdRun(baseUrl, statePath) {
   if (!node_id || !node_secret) throw new Error('Invalid state file; run setup first');
 
   let lastHash = null;
-  let lastSentAt = 0;
+  let lastSentAt = 0; // timestamp of last successful report
   const dedupeWindowMs = 60_000;
 
   // eslint-disable-next-line no-constant-condition
@@ -658,7 +723,7 @@ async function cmdRun(baseUrl, statePath) {
     try {
       policy = await postPolicy(baseUrl, node_id, node_secret);
     } catch (e) {
-      console.error('[clawwatch-agent] report_policy failed:', e.message || e);
+      console.error(`[ClawWatch] ${t('policyFailed')}:`, e.message || e);
       await sleep(30_000);
       continue;
     }
@@ -673,6 +738,16 @@ async function cmdRun(baseUrl, statePath) {
     const basePayload = buildPayloadFromEnv(node_id);
     const latMs = await measureWorkerLatencyMs(baseUrl);
     if (latMs != null) basePayload.api_latency = latMs;
+
+    // ── Task 2: node-down alert ─────────────────────────────────────────────
+    const nodeUptime = basePayload.uptime_seconds ?? 0;
+    if (nodeUptime > 180) {
+      const timeSinceLastReport = lastSentAt > 0 ? Date.now() - lastSentAt : -1;
+      if (timeSinceLastReport > 180_000) {
+        basePayload.alert = 'node_down';
+      }
+    }
+
     const body = JSON.stringify(basePayload);
     const hash = sha256Hex(body);
     const now = Date.now();
@@ -692,7 +767,7 @@ async function cmdRun(baseUrl, statePath) {
         await sleep(intervalSec * 1000);
       }
     } catch (e) {
-      console.error('[clawwatch-agent] report failed:', e.message || e);
+      console.error(`[ClawWatch] ${t('reportFailed')}:`, e.message || e);
       await sleep(intervalSec * 1000);
     }
   }
