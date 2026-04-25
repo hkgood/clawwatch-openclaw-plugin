@@ -297,8 +297,8 @@ function getTodayTokenStats() {
             try {
               const obj = JSON.parse(line.replace(/,$/, '').trim());
               if (obj?.type === 'error') { errorCount++; continue; }
-              // 收集 sessionId 用于统计真正的活跃会话数
-              if (obj?.sessionId) todayActiveSessionIds.add(obj.sessionId);
+              // 收集 session id（jsonl 里 session 条目的 id 字段即 sessionId）用于统计真正的活跃会话数
+              if (obj?.id && obj?.type === 'session') todayActiveSessionIds.add(obj.id);
               if (obj?.message?.usage) {
                 const u = obj.message.usage;
                 freshInput += u.input || 0;
