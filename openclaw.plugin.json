@@ -1,5 +1,5 @@
 {
-  "id": "clawwatch",
+  "id": "clawwatch-openclaw",
   "name": "ClawWatch",
   "description": "ClawWatch node agent: register with Worker (https://cw.osglab.win), bind via link token or binding code, and report telemetry. Ships clawwatch-agent CLI plus a Gateway background service for adaptive reporting.",
   "configSchema": {
@@ -12,7 +12,7 @@
       },
       "worker_base_url": {
         "type": "string",
-        "description": "ClawWatch Worker base URL (no trailing slash required). Default: https://cw.osglab.win — override for self-hosted Workers."
+        "description": "ClawWatch Worker base URL (no trailing slash required). Default: https://cw.osglab.win \u2014 override for self-hosted Workers."
       }
     }
   }
