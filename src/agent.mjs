@@ -228,8 +228,36 @@ function getGpuModel() {
 }
 
 function getVramUsage() {
-  // Apple M4 uses unified memory — VRAM is shared with system RAM.
-  // Try to parse dedicated VRAM on discrete GPUs (Intel/w dGPU), return null for Apple Silicon.
+  // Apple Silicon: unified memory — VRAM = system RAM used by GPU/CPU combined.
+  // On discrete GPUs (Intel/NVIDIA/AMD): dedicated VRAM via nvidia-smi or system_profiler.
+  try {
+    // Try nvidia-smi first (discrete GPU on Linux/Windows)
+    const nvidia = execSync('nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null', { timeout: 3000 }).toString().trim();
+    if (/^\d+$/.test(nvidia)) return parseInt(nvidia, 10);
+  } catch { /* no nvidia-smi */ }
+
+  try {
+    // Try system_profiler for dedicated VRAM (Intel dGPU or AMD GPU on Mac)
+    const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1', { timeout: 5000 }).toString().trim();
+    const mb = out.match(/(\d+)\s*MB/i)?.[1];
+    if (mb) return parseInt(mb, 10);
+    const gb = out.match(/(\d+)\s*GB/i)?.[1];
+    if (gb) return parseInt(gb, 10) * 1024;
+  } catch { /* ignore */ }
+
+  // Apple Silicon unified memory: used = total - free
+  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+  const freeMb = Math.round(os.freemem() / 1024 / 1024);
+  return totalMb - freeMb; // MB of unified memory currently in use
+}
+
+function getVramTotal() {
+  // Total VRAM / unified memory pool in MB
+  try {
+    const nvidia = execSync('nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null', { timeout: 3000 }).toString().trim();
+    if (/^\d+$/.test(nvidia)) return parseInt(nvidia, 10);
+  } catch { /* no nvidia-smi */ }
+
   try {
     const out = execSync('system_profiler SPDisplaysDataType 2>/dev/null | grep -i "VRAM" | head -1', { timeout: 5000 }).toString().trim();
     const mb = out.match(/(\d+)\s*MB/i)?.[1];
@@ -237,14 +265,18 @@ function getVramUsage() {
     const gb = out.match(/(\d+)\s*GB/i)?.[1];
     if (gb) return parseInt(gb, 10) * 1024;
   } catch { /* ignore */ }
-  return null; // null = unified memory (Apple Silicon) or unavailable
+
+  // Apple Silicon unified memory total
+  return Math.round(os.totalmem() / 1024 / 1024); // MB
 }
 
 function getGpuLoad() {
-  // Apple Silicon (M-series): GPU is integrated; no user-accessible GPU load without root.
-  // powermetrics requires sudo. top -stats gpu produces no output on macOS.
-  // Estimate: Apple Silicon GPU activity is proportional to overall CPU pressure.
-  // Leave as null to indicate "not measured" — cpu_load is the best proxy.
+  // Apple Silicon: no reliable per-app GPU load without root (powermetrics needs sudo).
+  // Leave as null — cpu_load is the best proxy for overall system pressure.
+  try {
+    const nvidia = execSync('nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null', { timeout: 3000 }).toString().trim();
+    if (/^\d+$/.test(nvidia)) return parseInt(nvidia, 10);
+  } catch { /* no nvidia-smi */ }
   return null;
 }
 
@@ -587,6 +619,8 @@ function buildPayloadFromEnv(node_id) {
       gpu_model: gpuModel,
       gpu_load: getGpuLoad(),
       vram_usage: getVramUsage(),
+      vram_total: getVramTotal(),
+      memory_total: Math.round(os.totalmem() / 1024 / 1024),
       active_model: getActiveModel(),
       agents_summary: getAgentsSummary(),
       // Token stats from jsonl session transcripts
