@@ -1,5 +1,5 @@
 {
-  "id": "clawwatch-openclaw",
+  "id": "clawwatch-openclaw-plugin",
   "name": "ClawWatch",
   "description": "ClawWatch node agent: register with Worker (https://cw.osglab.win), bind via link token or binding code, and report telemetry. Ships clawwatch-agent CLI plus a Gateway background service for adaptive reporting.",
   "configSchema": {
