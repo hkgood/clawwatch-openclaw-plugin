@@ -1,5 +1,5 @@
 {
-  "name": "clawwatch-openclaw",
+  "name": "clawwatch-openclaw-plugin",
   "version": "1.3.14",
   "description": "OpenClaw plugin + CLI: ClawWatch node agent (setup, bind, adaptive report to ClawWatch Worker)",
   "type": "module",
