@@ -245,8 +245,9 @@ function getDiskUsage() {
 
 function getVersion() {
   try {
-    // Try openclaw version first, then node version
-    const out = execSync('openclaw --version 2>/dev/null || node --version', { timeout: 3000 }).toString().trim();
+    // Use bash -l to load user's shell env (PATH includes Homebrew/usr/local/bin).
+    // Without shell login, the spawned Node process may not find `openclaw` in PATH.
+    const out = execSync('bash -l -c "openclaw --version 2>/dev/null || node --version"', { timeout: 3000 }).toString().trim();
     return out.replace(/^v/, '');
   } catch {
     return process.version.replace(/^v/, '');
